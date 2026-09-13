@@ -105,11 +105,18 @@ pub fn start(app: AppHandle, state: Arc<AppState>) {
                     let _ = request.respond(cors(Response::from_string("spool")));
                 }
                 (Method::Post, "/add") => {
-                    let mut body = String::new();
-                    if request.as_reader().read_to_string(&mut body).is_err() {
-                        let _ = request.respond(cors(Response::from_string("bad body").with_status_code(400)));
-                        continue;
-                    }
+                    const MAX_BODY: usize = 64 * 1024;
+                    let body = match read_body(request.as_reader(), MAX_BODY) {
+                        Ok(b) => b,
+                        Err(BodyError::TooLarge) => {
+                            let _ = request.respond(cors(Response::from_string("payload too large").with_status_code(413)));
+                            continue;
+                        }
+                        Err(BodyError::BadBody) => {
+                            let _ = request.respond(cors(Response::from_string("bad body").with_status_code(400)));
+                            continue;
+                        }
+                    };
                     // Hand to the worker pool: a video /add blocks on a ~15s
                     // yt-dlp metadata probe, and the accept loop must stay free
                     // to answer /ping meanwhile.
@@ -125,10 +132,40 @@ pub fn start(app: AppHandle, state: Arc<AppState>) {
     });
 }
 
-fn handle_add(app: &AppHandle, state: &Arc<AppState>, body: &str) -> Result<String, String> {
+#[derive(Debug, PartialEq, Eq)]
+enum BodyError {
+    TooLarge,
+    BadBody,
+}
+
+/// Read request body up to `max_bytes`. If the incoming stream exceeds
+/// `max_bytes`, returns `TooLarge` even if the cutoff falls in the middle
+/// of a multi-byte UTF-8 character.
+fn read_body<R: Read>(mut reader: R, max_bytes: usize) -> Result<String, BodyError> {
+    let mut buf = Vec::new();
+    let mut limited = reader.take((max_bytes + 1) as u64);
+    if limited.read_to_end(&mut buf).is_err() {
+        return Err(BodyError::BadBody);
+    }
+    if buf.len() > max_bytes {
+        return Err(BodyError::TooLarge);
+    }
+    String::from_utf8(buf).map_err(|_| BodyError::BadBody)
+}
+
+fn parse_add_payload(body: &str) -> Result<AddRequest, String> {
     let req: AddRequest =
         serde_json::from_str(body).map_err(|e| format!("invalid request JSON: {e}"))?;
 
+    if req.url.trim().is_empty() {
+        return Err("empty URL".to_string());
+    }
+
+    Ok(req)
+}
+
+fn handle_add(app: &AppHandle, state: &Arc<AppState>, body: &str) -> Result<String, String> {
+    let req = parse_add_payload(body)?;
     let session = session_from(&req);
 
     // Hand off to the same async path the UI uses. The bridge thread is
@@ -275,6 +312,46 @@ mod tests {
         assert!(serde_json::from_str::<AddRequest>(r#"{"cookie":"a=1"}"#).is_err());
         assert!(serde_json::from_str::<AddRequest>("not json").is_err());
         assert!(serde_json::from_str::<AddRequest>(r#"{"url":42}"#).is_err());
+    }
+
+    #[test]
+    fn blank_url_is_rejected() {
+        let err = parse_add_payload(r#"{"url":"   "}"#).unwrap_err();
+        assert_eq!(err, "empty URL");
+
+        let err_empty = parse_add_payload(r#"{"url":""}"#).unwrap_err();
+        assert_eq!(err_empty, "empty URL");
+    }
+
+    #[test]
+    fn read_body_accepts_under_limit() {
+        let data = "hello world".as_bytes();
+        let res = read_body(data, 64).unwrap();
+        assert_eq!(res, "hello world");
+    }
+
+    #[test]
+    fn read_body_rejects_payload_too_large() {
+        let data = vec![b'a'; 100];
+        let err = read_body(&data[..], 50).unwrap_err();
+        assert_eq!(err, BodyError::TooLarge);
+    }
+
+    /// When a payload over the limit is cut off in the middle of a multi-byte
+    /// UTF-8 sequence, it must report TooLarge (413), not BadBody (400).
+    #[test]
+    fn read_body_returns_too_large_even_if_cutoff_splits_utf8() {
+        let mut data = vec![b'a'; 10];
+        data.extend_from_slice("🦀".as_bytes()); // 4-byte character
+        let err = read_body(&data[..], 11).unwrap_err();
+        assert_eq!(err, BodyError::TooLarge);
+    }
+
+    #[test]
+    fn read_body_rejects_invalid_utf8_under_limit() {
+        let data = [0xFF, 0xFE, 0xFD];
+        let err = read_body(&data[..], 10).unwrap_err();
+        assert_eq!(err, BodyError::BadBody);
     }
 
     /// The extension sends "" for a header it could not read. An empty

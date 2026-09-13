@@ -83,4 +83,14 @@ describe("suggestedName", () => {
     // decodeURIComponent throws on "%zz"; the caller must still get a string.
     expect(() => suggestedName("https://example.com/bad%zz.zip")).not.toThrow();
   });
+
+  it("extracts display name from magnet links", () => {
+    expect(
+      suggestedName("magnet:?xt=urn:btih:abc&dn=Ubuntu+22.04+Desktop&tr=http://tracker"),
+    ).toBe("Ubuntu 22.04 Desktop");
+    expect(
+      suggestedName("magnet:?xt=urn:btih:abc&dn=My%20Cool%20File.iso"),
+    ).toBe("My Cool File.iso");
+    expect(suggestedName("magnet:?xt=urn:btih:abc")).toBe("torrent");
+  });
 });

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Check, Copy, ExternalLink, Folder, ShieldCheck, X } from "lucide-react";
+import { toast } from "sonner";
 import { api, formatBytes, formatDate, type DownloadView } from "../lib/api";
 import { Button } from "./ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "./ui/dialog";
@@ -136,7 +137,15 @@ export function DetailModal({
               </Button>
             </>
           )}
-          <Button variant="outline" onClick={() => navigator.clipboard.writeText(row.url)}>
+          <Button
+            variant="outline"
+            onClick={() => {
+              navigator.clipboard
+                .writeText(row.url)
+                .then(() => toast.success("URL copied to clipboard"))
+                .catch((e) => toast.error(String(e)));
+            }}
+          >
             <Copy /> Copy URL
           </Button>
         </div>
@@ -198,8 +207,13 @@ function Checksum({ id }: { id: string }) {
             <Button
               variant="ghost"
               size="icon-xs"
-              title="Copy"
-              onClick={() => navigator.clipboard.writeText(digest)}
+              title="Copy checksum"
+              onClick={() => {
+                navigator.clipboard
+                  .writeText(digest)
+                  .then(() => toast.success("Checksum copied to clipboard"))
+                  .catch((e) => toast.error(String(e)));
+              }}
             >
               <Copy />
             </Button>
@@ -239,8 +253,13 @@ function Field({
           <Button
             variant="ghost"
             size="icon-xs"
-            title="Copy"
-            onClick={() => navigator.clipboard.writeText(value)}
+            title={`Copy ${label}`}
+            onClick={() => {
+              navigator.clipboard
+                .writeText(value)
+                .then(() => toast.success(`${label} copied to clipboard`))
+                .catch((e) => toast.error(String(e)));
+            }}
           >
             <Copy />
           </Button>

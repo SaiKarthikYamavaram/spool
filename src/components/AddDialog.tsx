@@ -49,7 +49,15 @@ export function isStreamManifest(url: string): boolean {
 /// Content-Disposition or the video's title wins when the field is left blank.
 export function suggestedName(url: string): string {
   try {
-    const last = new URL(url).pathname.split("/").filter(Boolean).pop() ?? "";
+    const trimmed = url.trim();
+    if (/^magnet:\?/i.test(trimmed)) {
+      const match = trimmed.match(/[?&]dn=([^&]+)/i);
+      if (match && match[1]) {
+        return decodeURIComponent(match[1].replace(/\+/g, " "));
+      }
+      return "torrent";
+    }
+    const last = new URL(trimmed).pathname.split("/").filter(Boolean).pop() ?? "";
     return decodeURIComponent(last);
   } catch {
     return "";

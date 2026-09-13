@@ -44,7 +44,8 @@ impl Throttle {
             return Throttle::unlimited();
         }
 
-        let per_tick = ((kb_per_sec * 1024) / (1000 / REFILL_MS)) as usize;
+        let per_tick = (kb_per_sec.saturating_mul(1024) / (1000 / REFILL_MS))
+            .min((usize::MAX / 4) as u64) as usize;
         let per_tick = per_tick.max(1);
         // Scale the acquire slice with the cap so a high limit doesn't force
         // dozens of tiny semaphore acquisitions per network chunk, while never

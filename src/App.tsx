@@ -1151,7 +1151,14 @@ const Row = memo(function Row({
                 <Folder /> Open folder
               </DropdownMenuItem>
             )}
-            <DropdownMenuItem onClick={() => navigator.clipboard.writeText(row.url)}>
+            <DropdownMenuItem
+              onClick={() => {
+                navigator.clipboard
+                  .writeText(row.url)
+                  .then(() => toast.success("URL copied to clipboard"))
+                  .catch((e) => toast.error(String(e)));
+              }}
+            >
               <Copy /> Copy URL
             </DropdownMenuItem>
             {/* Reordering only means anything while a download is still

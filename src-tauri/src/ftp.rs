@@ -130,6 +130,10 @@ pub async fn prepare(
         .await
         .map_err(|e| format!("cannot create {}: {e}", dest_dir.display()))?;
 
+    if let Some(n) = total {
+        download::check_disk_space(dest_dir, n)?;
+    }
+
     let final_path = resolve_unique_path(dest_dir, &filename);
     let part = part_path(&final_path);
     // Claim the name now, exactly as the HTTP engine does, so two adds racing
@@ -225,8 +229,12 @@ where
         };
 
         // Charged before the write, like the HTTP engine, so the cap applies
-        // to what comes off the socket.
-        throttle.take(n).await;
+        // to what comes off the socket. Stays cancellable so a pause or cancel
+        // does not hang waiting on permits.
+        tokio::select! {
+            _ = token.cancelled() => break Err("cancelled".to_string()),
+            _ = throttle.take(n) => {}
+        }
 
         if let Err(e) = file.write_all(&buf[..n]).await {
             break Err(format!("cannot write {}: {e}", plan.part_path.display()));
@@ -242,11 +250,11 @@ where
     // Closes the data connection and reads the completion reply. A cancelled
     // transfer drops it instead — the control connection goes with it.
     if result.is_ok() {
-        stream
-            .finish()
+        tokio::time::timeout(std::time::Duration::from_secs(15), stream.finish())
             .await
+            .map_err(|_| "the server did not confirm the transfer: timed out waiting for completion".to_string())?
             .map_err(|e| format!("the server did not confirm the transfer: {e}"))?;
-        let _ = ftp.quit().await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), ftp.quit()).await;
     }
     result?;
 

@@ -908,12 +908,17 @@ impl SegmentProgress {
     /// A retry restarts from the last durable point, so anything written but
     /// not yet synced is discarded and fetched again.
     fn rewind_to_durable(&self) {
-        self.live.store(self.durable.load(Ordering::Relaxed), Ordering::Relaxed);
+        let durable = self.durable.load(Ordering::Relaxed);
+        self.live.store(durable, Ordering::Relaxed);
+        let mut b = self.bounds.lock().unwrap();
+        b.frontier = b.start + durable;
     }
 
     fn reset(&self) {
         self.live.store(0, Ordering::Relaxed);
         self.durable.store(0, Ordering::Relaxed);
+        let mut b = self.bounds.lock().unwrap();
+        b.frontier = b.start;
     }
 }
 
@@ -1297,7 +1302,7 @@ where
 }
 
 /// Free space on the volume that will hold the file.
-fn check_disk_space(dest_dir: &Path, needed: u64) -> Result<(), String> {
+pub fn check_disk_space(dest_dir: &Path, needed: u64) -> Result<(), String> {
     let available = fs4::available_space(dest_dir)
         .map_err(|e| format!("cannot check free space on {}: {e}", dest_dir.display()))?;
     if available < needed.saturating_add(DISK_HEADROOM) {

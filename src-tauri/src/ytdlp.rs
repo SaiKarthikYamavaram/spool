@@ -95,7 +95,7 @@ pub async fn resolve_meta(
     if let Some(p) = proxy.filter(|p| !p.is_empty()) {
         cmd.arg("--proxy").arg(p);
     }
-    cmd.arg(url).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+    cmd.arg("--").arg(url).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
 
     let out = match tokio::time::timeout(Duration::from_secs(15), cmd.output()).await {
         Ok(Ok(o)) if o.status.success() => o,
@@ -203,7 +203,7 @@ where
         cmd.arg("--proxy").arg(p);
     }
 
-    cmd.arg(url);
+    cmd.arg("--").arg(url);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.kill_on_drop(true);
 
@@ -252,6 +252,7 @@ where
                     unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
                 }
                 let _ = child.kill().await;
+                let _ = child.wait().await;
                 return Err("cancelled".into());
             }
             line = reader.next_line() => {

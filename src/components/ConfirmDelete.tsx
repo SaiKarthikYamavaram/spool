@@ -1,4 +1,5 @@
 import { Trash2 } from "lucide-react";
+import { toast } from "sonner";
 import { api, type DownloadView } from "../lib/api";
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
@@ -27,11 +28,11 @@ export function ConfirmDelete({
   const ids = rows.map((r) => r.id);
 
   function removeOnly() {
-    api.bulk(ids, "remove");
+    api.bulk(ids, "remove").catch((e) => toast.error(String(e)));
     onClose();
   }
   function deleteFile() {
-    api.bulk(ids, "remove_with_file");
+    api.bulk(ids, "remove_with_file").catch((e) => toast.error(String(e)));
     onClose();
   }
 

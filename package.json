@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "build:appimage": "bash src-tauri/build-appimage.sh",
     "test": "vitest run",
     "test:watch": "vitest"
   },

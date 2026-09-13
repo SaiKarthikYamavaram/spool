@@ -63,6 +63,8 @@ export function DetailModal({
                 ? "yt-dlp engine"
                 : row.engine === "ftp"
                 ? "1 (FTP, resumed with REST)"
+                : row.engine === "torrent"
+                ? "BitTorrent swarm"
                 : row.supports_ranges
                   ? `${row.segments} (server supports byte ranges)`
                   : "1 (server has no range support)"

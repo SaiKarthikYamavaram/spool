@@ -5,6 +5,7 @@ mod queue;
 mod server;
 mod state;
 mod thumbs;
+mod torrent;
 mod throttle;
 mod ytdlp;
 

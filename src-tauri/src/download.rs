@@ -1045,6 +1045,8 @@ pub enum Engine {
     YtDlp,
     /// Plain FTP, resumed with `REST` (see `ftp.rs`).
     Ftp,
+    /// BitTorrent, via librqbit (see `torrent.rs`).
+    Torrent,
 }
 
 /// Everything decided before the first byte moves: where the file goes, how

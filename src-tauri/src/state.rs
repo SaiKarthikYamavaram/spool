@@ -221,6 +221,10 @@ pub struct AppState {
     pending: Mutex<HashMap<String, PendingAdd>>,
     /// Set when progress moved; a single flusher persists it (see `mark_dirty`).
     dirty: std::sync::atomic::AtomicBool,
+    /// The BitTorrent session, started the first time a torrent is added.
+    /// Never started otherwise: it opens a listening port and joins the DHT,
+    /// which a user who only downloads over HTTP has not asked for.
+    torrent: tokio::sync::OnceCell<Arc<librqbit::Session>>,
     data_dir: PathBuf,
     config_dir: PathBuf,
 }
@@ -249,6 +253,7 @@ impl AppState {
             settings: Mutex::new(settings),
             next_id: AtomicU64::new(next + 1),
             gen: AtomicU64::new(1),
+            torrent: tokio::sync::OnceCell::new(),
             // Built unlimited here (this runs off the async runtime, and
             // Throttle spawns a task); `rebuild_throttle` applies the saved cap
             // from a runtime context during setup.
@@ -319,6 +324,26 @@ impl AppState {
     /// Rebuild the shared limiter from the current bandwidth setting. Must be
     /// called from within the async runtime — `Throttle::new` spawns a refill
     /// task. A cap of 0 yields an unlimited (zero-overhead) throttle.
+    /// The BitTorrent session, started on first use and shared from then on.
+    ///
+    /// One per app, not one per download: a session owns the listening port,
+    /// the DHT node and the peer tables, and a second one would contend for
+    /// all three.
+    pub async fn torrent_session(
+        &self,
+        app: &AppHandle,
+    ) -> Result<Arc<librqbit::Session>, String> {
+        let dir = self.download_dir(app)?;
+        self.torrent
+            .get_or_try_init(|| async {
+                librqbit::Session::new(dir)
+                    .await
+                    .map_err(|e| format!("cannot start the BitTorrent session: {e:#}"))
+            })
+            .await
+            .map(Arc::clone)
+    }
+
     pub fn rebuild_throttle(&self) {
         let kb = self.settings().bandwidth_kb;
         *self.throttle.lock().unwrap() = Throttle::new(kb);
@@ -393,6 +418,7 @@ impl AppState {
                     download::Engine::YtDlp => "ytdlp".into(),
                     download::Engine::Http => "http".into(),
                     download::Engine::Ftp => "ftp".into(),
+                    download::Engine::Torrent => "torrent".into(),
                 },
                 }
             })
@@ -606,6 +632,14 @@ impl AppState {
                 dir
             };
             download::video_plan(url, &dir, title, thumbnail, custom_name)?
+        } else if crate::torrent::is_torrent_url(url) {
+            // No network here: a magnet knows nothing until it has found peers
+            // with the metadata, so the row starts on its display name.
+            let dir = if categorize { dir.join("Torrents") } else { dir };
+            tokio::fs::create_dir_all(&dir)
+                .await
+                .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+            crate::torrent::prepare(url, &dir, custom_name)?
         } else if crate::ftp::is_ftp_url(url) {
             crate::ftp::prepare(url, &session, &dir, categorize, custom_name).await?
         } else {
@@ -934,7 +968,9 @@ fn spawn_transfer(app: AppHandle, state: Arc<AppState>, entry: Download) {
     tauri::async_runtime::spawn(async move {
         let plan = entry.plan.clone();
 
-        let result: Result<PathBuf, String> = if plan.engine == download::Engine::Ftp {
+        let result: Result<PathBuf, String> = if plan.engine == download::Engine::Torrent {
+            run_torrent(&app, &state, &plan, &progress, &id, token.clone()).await
+        } else if plan.engine == download::Engine::Ftp {
             run_ftp(&app, &state, &entry, &plan, &progress, &id, token.clone()).await
         } else if plan.engine == download::Engine::YtDlp {
             run_video(
@@ -975,7 +1011,13 @@ fn spawn_transfer(app: AppHandle, state: Arc<AppState>, entry: Download) {
         match result {
             Ok(path) => {
                 // yt-dlp only knows the real filename once it finishes.
-                if plan.engine == download::Engine::YtDlp {
+                // Both of these only learn their real output path at the end:
+                // yt-dlp picks the container, a torrent names itself from its
+                // metadata.
+                if matches!(
+                    plan.engine,
+                    download::Engine::YtDlp | download::Engine::Torrent
+                ) {
                     state.set_final_path(&id, path.clone());
                 }
                 state.set_status(&id, Status::Completed, None);
@@ -1060,6 +1102,73 @@ async fn run_http(
                 "download://progress",
                 ProgressRow { id: row_id.clone(), downloaded, total },
             );
+        },
+    )
+    .await;
+
+    checkpoint.abort();
+    result
+}
+
+/// The torrent run: librqbit owns the transfer, so this is a bridge between
+/// its stats and the queue's counters.
+async fn run_torrent(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    plan: &download::DownloadPlan,
+    progress: &Progress,
+    id: &str,
+    token: CancellationToken,
+) -> Result<PathBuf, String> {
+    let session = state.torrent_session(app).await?;
+
+    let checkpoint = {
+        let state = Arc::clone(state);
+        let id = id.to_string();
+        let progress = progress.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = interval.tick() => {
+                        state.record_progress(&id, &progress);
+                        state.mark_dirty();
+                    }
+                }
+            }
+        })
+    };
+
+    let emitter = app.clone();
+    let row_id = id.to_string();
+    let size_state = Arc::clone(state);
+    let size_id = id.to_string();
+
+    // A magnet's real name arrives with its metadata, well after the row does.
+    let name_app = app.clone();
+    let name_state = Arc::clone(state);
+    let name_id = id.to_string();
+
+    let result = crate::torrent::run(
+        &session,
+        plan,
+        progress,
+        token,
+        move |downloaded, total| {
+            if let Some(total) = total {
+                size_state.set_total(&size_id, total);
+            }
+            let _ = emitter.emit(
+                "download://progress",
+                ProgressRow { id: row_id.clone(), downloaded, total },
+            );
+        },
+        move |name| {
+            name_state.set_display_name(&name_id, name);
+            emit_queue(&name_app, &name_state);
         },
     )
     .await;
@@ -1256,6 +1365,17 @@ pub fn emit_queue(app: &AppHandle, state: &Arc<AppState>) {
 fn delete_artifacts(plan: &download::DownloadPlan, partial_only: bool) {
     match plan.engine {
         download::Engine::YtDlp => cleanup_by_stem(&plan.final_path),
+        // A torrent writes whatever its metadata described — one file or a
+        // whole folder — under the output path, and librqbit keeps no separate
+        // `.part`. An unfinished one has files worth removing too, so
+        // `partial_only` does not spare it.
+        download::Engine::Torrent => {
+            if plan.final_path.is_dir() {
+                let _ = std::fs::remove_dir_all(&plan.final_path);
+            } else {
+                let _ = std::fs::remove_file(&plan.final_path);
+            }
+        }
         // FTP writes the same single `.part` the HTTP engine does, so it is
         // cleaned the same way.
         download::Engine::Http | download::Engine::Ftp => {

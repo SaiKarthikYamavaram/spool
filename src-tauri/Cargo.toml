@@ -36,6 +36,7 @@ tauri-plugin-window-state = "2"
 base64 = "0.23.1"
 tauri-plugin-autostart = "2"
 suppaftp = { version = "12.0.0", features = ["tokio"] }
+librqbit = "9.0.1"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

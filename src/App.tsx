@@ -368,6 +368,10 @@ function App() {
     (id: string, delta: number) => api.move(id, delta).catch(report),
     [report],
   );
+  const handleReorder = useCallback(
+    (id: string, target: string) => api.moveTo(id, target).catch(report),
+    [report],
+  );
 
   /// A link dragged out of a browser and dropped on the window. It arrives as
   /// `text/uri-list`, or as plain text from anything that does not set it.
@@ -375,6 +379,8 @@ function App() {
   /// lets the webview see the event at all.
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
+    // A row dragged to reorder and let go between rows is not a link.
+    if (e.dataTransfer.types.includes(ROW_DRAG)) return;
     const text =
       e.dataTransfer.getData("text/uri-list") || e.dataTransfer.getData("text/plain");
     // Whatever else was dragged (a file, an image, a selection) is not a
@@ -697,6 +703,7 @@ function App() {
                   onDelete={handleDelete}
                   onRename={handleRename}
                   onMove={handleMove}
+                  onReorder={handleReorder}
                   onFail={report}
                   selectMode={selectMode}
                   selected={selected.ids.has(row.id)}
@@ -876,8 +883,12 @@ function hostnameOf(url: string): string | null {
   }
 }
 
+/// Drag payload type for reordering rows; a link dropped from outside never
+/// carries it.
+const ROW_DRAG = "application/x-spool-row";
+
 const Row = memo(function Row({
-  row, liveBytes, liveTotal, speed, onOpen, onDelete, onRename, onMove,
+  row, liveBytes, liveTotal, speed, onOpen, onDelete, onRename, onMove, onReorder,
   selectMode, selected, onSelect, onFail,
 }: {
   row: DownloadView;
@@ -889,6 +900,8 @@ const Row = memo(function Row({
   onRename: (id: string) => void;
   /// Negative moves the row up the queue; a large magnitude clamps to an end.
   onMove: (id: string, delta: number) => void;
+  /// A row dropped onto this one: move it to this row's place.
+  onReorder: (id: string, target: string) => void;
   selectMode: boolean;
   selected: boolean;
   onSelect: (id: string, extend: boolean) => void;
@@ -921,6 +934,23 @@ const Row = memo(function Row({
       // In selection mode the whole row is the target, so the tile is an
       // indicator rather than the only thing you can hit.
       onClick={selectMode ? (e) => onSelect(row.id, e.shiftKey) : undefined}
+      // Dragging a row onto another moves it there in the queue. Off in
+      // selection mode, where a press means "pick this row".
+      draggable={!selectMode}
+      onDragStart={(e) => {
+        e.dataTransfer.setData(ROW_DRAG, row.id);
+        e.dataTransfer.effectAllowed = "move";
+      }}
+      onDragOver={(e) => {
+        if (e.dataTransfer.types.includes(ROW_DRAG)) e.preventDefault();
+      }}
+      onDrop={(e) => {
+        const from = e.dataTransfer.getData(ROW_DRAG);
+        if (!from) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (from !== row.id) onReorder(from, row.id);
+      }}
     >
       {/* Selection has no column of its own: a picked row swaps its file-type
           tile for a filled check, so entering the mode never re-flows the row

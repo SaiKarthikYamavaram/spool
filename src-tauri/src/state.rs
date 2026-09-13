@@ -817,6 +817,20 @@ impl AppState {
         self.save_queue();
     }
 
+    /// Move an entry to where `target` sits, the way a dragged row lands:
+    /// dragged down it ends up after the target, dragged up before it.
+    pub fn move_to(&self, id: &str, target: &str) {
+        let delta = {
+            let queue = self.queue.lock().unwrap();
+            let pos = |x: &str| queue.iter().position(|d| d.id == x);
+            match (pos(id), pos(target)) {
+                (Some(from), Some(to)) => to as i32 - from as i32,
+                _ => return,
+            }
+        };
+        self.move_entry(id, delta);
+    }
+
     /// True once nothing is running and nothing is waiting to run — the
     /// condition the "when everything is done" action fires on.
     pub fn all_done(&self) -> bool {
@@ -1829,6 +1843,22 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].token, token);
         assert!(state.take_pending(&token).is_some(), "listing must not consume the request");
+    }
+
+    #[test]
+    fn a_dropped_row_takes_the_target_place() {
+        let state = app();
+        for id in ["a", "b", "c", "d"] {
+            push(&state, id);
+        }
+        let order = |s: &AppState| s.queue.lock().unwrap().iter().map(|d| d.id.clone()).collect::<Vec<_>>();
+
+        state.move_to("d", "b");
+        assert_eq!(order(&state), ["a", "d", "b", "c"], "dragged up lands before the target");
+        state.move_to("a", "b");
+        assert_eq!(order(&state), ["d", "b", "a", "c"], "dragged down lands after it");
+        state.move_to("a", "gone");
+        assert_eq!(order(&state), ["d", "b", "a", "c"], "an unknown target moves nothing");
     }
 
     /// A dialog closed by shutting the window never answers. Without the sweep

@@ -208,6 +208,13 @@ fn move_download(app: AppHandle, state: Shared<'_>, id: String, delta: i32) {
     state::pump(&app, &state);
 }
 
+/// Drop an entry onto another row's place in the queue.
+#[tauri::command]
+fn move_download_to(app: AppHandle, state: Shared<'_>, id: String, target: String) {
+    state.move_to(&id, &target);
+    state::pump(&app, &state);
+}
+
 /// Requests parked before the window was listening: a link spool was launched
 /// with, or an extension capture during startup.
 #[tauri::command]
@@ -858,6 +865,7 @@ pub fn run() {
             rename_download,
             bulk_action,
             move_download,
+            move_download_to,
             pending_confirms,
             hash_file,
             pause_all,

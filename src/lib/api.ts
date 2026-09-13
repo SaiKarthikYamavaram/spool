@@ -125,6 +125,8 @@ export const api = {
   /// download ahead of the others. Negative is up; a big magnitude clamps to
   /// an end ("to the top").
   move: (id: string, delta: number) => invoke<void>("move_download", { id, delta }),
+  /// Drop a row onto another's place in the queue.
+  moveTo: (id: string, target: string) => invoke<void>("move_download_to", { id, target }),
   /// Hash a finished file to check it against a published checksum.
   hashFile: (id: string, algo: "sha256" | "md5") =>
     invoke<string>("hash_file", { id, algo }),

@@ -86,6 +86,10 @@ export const api = {
     return typeof picked === "string" ? picked : null;
   },
   importUrls: (text: string) => invoke<string[]>("import_urls", { text }),
+  /// Walk a page (and optionally the pages it links to) for downloadable
+  /// links. Returns what it found; nothing is queued until the user confirms.
+  grabLinks: (url: string, depth: number, filter: string) =>
+    invoke<string[]>("grab_links", { url, depth, filter }),
   isDuplicate: (url: string) => invoke<boolean>("is_duplicate", { url }),
   /// Apply one action to a whole selection in a single call, so the list
   /// re-renders once instead of once per row.

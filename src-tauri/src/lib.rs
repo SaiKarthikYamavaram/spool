@@ -3,6 +3,7 @@ mod download;
 mod ftp;
 mod queue;
 mod server;
+mod spider;
 mod state;
 mod thumbs;
 mod torrent;
@@ -110,6 +111,23 @@ async fn import_urls(
 
     state::pump(&app, &state);
     Ok(skipped)
+}
+
+/// Walk a page for downloadable links and return what it found, without
+/// queuing anything. The user confirms the list in the add dialog — a spider
+/// that queued its own results would be a very fast way to fill a disk.
+#[tauri::command]
+async fn grab_links(
+    state: Shared<'_>,
+    url: String,
+    depth: u32,
+    filter: String,
+) -> Result<Vec<String>, String> {
+    let session = state.session_for(&url, None);
+    let client = download::build_client(&session)?;
+    // Two levels is already MAX_PAGES fetches; deeper is a web crawler, not a
+    // download manager.
+    spider::crawl(&client, &url, depth.min(2), &filter).await
 }
 
 #[tauri::command]
@@ -545,6 +563,7 @@ pub fn run() {
             cancel_pending,
             get_download_dir,
             import_urls,
+            grab_links,
             is_duplicate,
             pause_download,
             resume_download,

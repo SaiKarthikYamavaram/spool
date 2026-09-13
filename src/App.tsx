@@ -4,7 +4,7 @@ import { toast } from "sonner";
 import {
   Archive, BookOpen, Captions, Check, CircleAlert, CircleCheckBig, Code2, Copy,
   Disc, Download, ExternalLink, File, FileText, Folder, Image, ListChecks,
-  Loader2, Magnet, MoreVertical, Music, Package, Pause, Pencil, Play, Plus,
+  Loader2, Magnet, MoreVertical, Music, Network, Package, Pause, Pencil, Play, Plus,
   Presentation, RotateCcw, Search, Sheet, Trash2, Type as TypeIcon,
   Video, X,
 } from "lucide-react";
@@ -25,6 +25,7 @@ import { RenameDialog } from "./components/RenameDialog";
 import * as selection from "./lib/selection";
 import { categoryOf, kindOf, type Category, type Kind } from "./lib/filetype";
 import { AddDialog } from "./components/AddDialog";
+import { SpiderDialog } from "./components/SpiderDialog";
 import { RingProgress } from "./components/Loaders";
 import { Sidebar, type QueueFilter } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
@@ -140,6 +141,8 @@ function App() {
   const [pendingToken, setPendingToken] = useState<string | null>(null);
   // Import opens the same dialog with its URL field as a list.
   const [pendingMulti, setPendingMulti] = useState(false);
+  // The link grabber, which feeds its results into that same dialog.
+  const [spiderOpen, setSpiderOpen] = useState(false);
 
   // Live bytes arrive far more often than the queue snapshot, so they are kept
   // out of React state and merged at render time.
@@ -580,6 +583,16 @@ function App() {
                 variant="ghost"
                 type="button"
                 className="shrink-0 rounded-lg h-8 px-2 sm:px-3 text-xs sm:text-sm"
+                title="Grab every file a page links to"
+                onClick={() => setSpiderOpen(true)}
+              >
+                <Network className="size-3.5" />
+                <span className="hidden sm:inline">Grab</span>
+              </Button>
+              <Button
+                variant="ghost"
+                type="button"
+                className="shrink-0 rounded-lg h-8 px-2 sm:px-3 text-xs sm:text-sm"
                 title="Import URLs"
                 onClick={() => { setPendingMulti(true); setPendingUrl(""); }}
               >
@@ -755,6 +768,17 @@ function App() {
       )}
       {renameRow && (
         <RenameDialog row={renameRow} onClose={() => setRenameId(null)} />
+      )}
+      {spiderOpen && (
+        <SpiderDialog
+          onClose={() => setSpiderOpen(false)}
+          onFound={(links) => {
+            setPendingToken(null);
+            setPendingMulti(true);
+            setPendingUrl(links.join("\n"));
+            toast.success(`Found ${links.length} links.`);
+          }}
+        />
       )}
       {pendingUrl !== null && (
         <AddDialog

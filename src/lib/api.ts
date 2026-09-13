@@ -107,6 +107,9 @@ export const api = {
   /// download ahead of the others. Negative is up; a big magnitude clamps to
   /// an end ("to the top").
   move: (id: string, delta: number) => invoke<void>("move_download", { id, delta }),
+  /// Hash a finished file to check it against a published checksum.
+  hashFile: (id: string, algo: "sha256" | "md5") =>
+    invoke<string>("hash_file", { id, algo }),
   pauseAll: () => invoke<void>("pause_all"),
   resumeAll: () => invoke<void>("resume_all"),
   /// A poster frame for a finished video, as a data: URI. Null for anything

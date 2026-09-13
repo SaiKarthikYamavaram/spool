@@ -185,6 +185,60 @@ fn move_download(app: AppHandle, state: Shared<'_>, id: String, delta: i32) {
     state::pump(&app, &state);
 }
 
+/// Hash a finished file so it can be checked against a published checksum.
+///
+/// Computed on demand rather than during the transfer: most downloads are
+/// never verified, and hashing every one of them would spend CPU and a second
+/// full read of the file for nothing.
+#[tauri::command]
+async fn hash_file(state: Shared<'_>, id: String, algo: String) -> Result<String, String> {
+    use tokio::io::AsyncReadExt;
+
+    let path = state
+        .finished_file(&id)
+        .ok_or_else(|| "That download has no finished file to hash.".to_string())?;
+
+    let mut file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+
+    // Streamed in chunks: a download manager's files are exactly the ones too
+    // big to hold in memory.
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut sha = <sha2::Sha256 as sha2::Digest>::new();
+    let mut md5 = <md5::Md5 as md5::Digest>::new();
+    let want_sha = algo != "md5";
+
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        if want_sha {
+            sha2::Digest::update(&mut sha, &buf[..n]);
+        } else {
+            md5::Digest::update(&mut md5, &buf[..n]);
+        }
+        // Hashing a multi-GB file would otherwise hold the runtime thread for
+        // its whole read.
+        tokio::task::yield_now().await;
+    }
+
+    let digest = if want_sha {
+        hex(&sha2::Digest::finalize(sha))
+    } else {
+        hex(&md5::Digest::finalize(md5))
+    };
+    Ok(digest)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[tauri::command]
 fn bulk_action(app: AppHandle, state: Shared<'_>, ids: Vec<String>, action: state::BulkAction) {
     state.bulk(&ids, action);
@@ -583,6 +637,7 @@ pub fn run() {
             rename_download,
             bulk_action,
             move_download,
+            hash_file,
             pause_all,
             resume_all,
             video_thumbnail,

@@ -1,7 +1,9 @@
-import { Copy, ExternalLink, Folder } from "lucide-react";
+import { useState } from "react";
+import { Check, Copy, ExternalLink, Folder, ShieldCheck, X } from "lucide-react";
 import { api, formatBytes, formatDate, type DownloadView } from "../lib/api";
 import { Button } from "./ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "./ui/dialog";
+import { Input } from "./ui/input";
 import { Progress } from "./ui/progress";
 
 /// Full detail for one download — the "properties" screen. Live progress is
@@ -107,6 +109,8 @@ export function DetailModal({
           </div>
         )}
 
+        {row.status === "completed" && <Checksum id={row.id} />}
+
         <div className="flex flex-wrap gap-2">
           {row.status === "completed" && (
             <>
@@ -124,6 +128,88 @@ export function DetailModal({
         </div>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/// Hash the finished file and check it against the one the site published.
+///
+/// Computed on demand: hashing is a second full read of the file, and most
+/// downloads are never verified. The comparison is done here rather than by
+/// eye — a wrong character in the middle of 64 hex digits is exactly what
+/// nobody spots.
+function Checksum({ id }: { id: string }) {
+  const [algo, setAlgo] = useState<"sha256" | "md5" | null>(null);
+  const [digest, setDigest] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [expected, setExpected] = useState("");
+
+  async function compute(next: "sha256" | "md5") {
+    setBusy(true);
+    setError(null);
+    setAlgo(next);
+    setDigest(null);
+    try {
+      setDigest(await api.hashFile(id, next));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const want = expected.trim().toLowerCase();
+  const matches = digest && want ? digest === want : null;
+
+  return (
+    <div className="space-y-2">
+      <h3 className="flex items-center gap-1.5 text-sm font-medium">
+        <ShieldCheck className="size-4" /> Checksum
+      </h3>
+      <div className="flex flex-wrap gap-2">
+        <Button size="sm" variant="outline" disabled={busy} onClick={() => compute("sha256")}>
+          {busy && algo === "sha256" ? "Hashing…" : "SHA-256"}
+        </Button>
+        <Button size="sm" variant="outline" disabled={busy} onClick={() => compute("md5")}>
+          {busy && algo === "md5" ? "Hashing…" : "MD5"}
+        </Button>
+      </div>
+
+      {error && <p className="text-sm text-destructive">{error}</p>}
+
+      {digest && (
+        <>
+          <div className="flex items-center gap-1.5 rounded-md border border-border/60 bg-muted/30 p-2">
+            <code className="min-w-0 flex-1 break-all font-mono text-[11px]">{digest}</code>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              title="Copy"
+              onClick={() => navigator.clipboard.writeText(digest)}
+            >
+              <Copy />
+            </Button>
+          </div>
+          <Input
+            value={expected}
+            onChange={(e) => setExpected(e.currentTarget.value)}
+            placeholder="Paste the published checksum to compare"
+            spellCheck={false}
+            className="font-mono text-xs"
+          />
+          {matches !== null && (
+            <p
+              className={`flex items-center gap-1.5 text-sm ${
+                matches ? "text-emerald-600 dark:text-emerald-400" : "text-destructive"
+              }`}
+            >
+              {matches ? <Check className="size-4" /> : <X className="size-4" />}
+              {matches ? "Matches — the file is intact." : "Does not match this file."}
+            </p>
+          )}
+        </>
+      )}
+    </div>
   );
 }
 

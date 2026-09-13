@@ -85,6 +85,20 @@ pub struct Settings {
     /// a launcher-started app should show itself.
     #[serde(default = "yes")]
     pub start_minimised: bool,
+    /// Only transfer inside a daily time window. Off by default: a download
+    /// manager that silently refuses to download is a support call.
+    #[serde(default)]
+    pub schedule_enabled: bool,
+    /// Window bounds as local `HH:MM`. A start later than the stop wraps over
+    /// midnight ("22:00" to "06:00"), which is the usual off-peak case.
+    #[serde(default)]
+    pub schedule_start: String,
+    #[serde(default)]
+    pub schedule_stop: String,
+    /// What to do once every download has finished: "none" (default), "quit",
+    /// or "shutdown" (powers the machine off).
+    #[serde(default)]
+    pub on_all_done: String,
 }
 
 /// Serde needs a function for a non-`false` bool default.
@@ -112,6 +126,10 @@ impl Default for Settings {
             run_in_background: true,
             start_on_login: true,
             start_minimised: true,
+            schedule_enabled: false,
+            schedule_start: "22:00".into(),
+            schedule_stop: "06:00".into(),
+            on_all_done: "none".into(),
         }
     }
 }
@@ -779,6 +797,16 @@ impl AppState {
         self.save_queue();
     }
 
+    /// True once nothing is running and nothing is waiting to run — the
+    /// condition the "when everything is done" action fires on.
+    pub fn all_done(&self) -> bool {
+        self.queue
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|d| d.is_terminal() || d.status == Status::Paused)
+    }
+
     /// Ask a running transfer to stop, leaving the partial file in place.
     pub fn pause(&self, id: &str) {
         if let Some(active) = self.active.lock().unwrap().remove(id) {
@@ -1059,6 +1087,7 @@ fn spawn_transfer(app: AppHandle, state: Arc<AppState>, entry: Download) {
 
         // A finished transfer frees a slot.
         pump(&app, &state);
+        finish_action(&app, &state);
     });
 }
 
@@ -1370,6 +1399,32 @@ async fn run_video(
         on_file,
     )
     .await
+}
+
+/// Carry out the "when everything is finished" setting, once everything
+/// actually is. Called after each transfer ends, so the last one to finish is
+/// the one that triggers it.
+///
+/// Quitting goes through `shutdown` for the same reason the close button does:
+/// in-flight offsets have to be checkpointed. Nothing is in flight here by
+/// definition, but the queue still needs its final write.
+fn finish_action(app: &AppHandle, state: &Arc<AppState>) {
+    let action = state.settings().on_all_done;
+    if action.is_empty() || action == "none" || !state.all_done() {
+        return;
+    }
+
+    state.shutdown();
+    if action == "shutdown" {
+        // Ask the session manager rather than the kernel: `systemctl poweroff`
+        // is the one command that works without root on a systemd desktop.
+        // A failure is reported and the app still quits — refusing to exit
+        // because the machine would not power off helps no one.
+        if let Err(e) = std::process::Command::new("systemctl").arg("poweroff").spawn() {
+            eprintln!("spool: could not power the machine off: {e}");
+        }
+    }
+    app.exit(0);
 }
 
 pub fn emit_queue(app: &AppHandle, state: &Arc<AppState>) {

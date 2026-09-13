@@ -290,6 +290,107 @@ async fn encode_thumb(path: &std::path::Path) -> Option<String> {
     ))
 }
 
+/// Minutes since local midnight, for the schedule window.
+///
+/// `libc::localtime_r` rather than a date crate: the only question being asked
+/// is what the wall clock says, and libc is already a dependency. It is also
+/// the only thing that knows the machine's timezone and its DST rules.
+fn local_minutes() -> u32 {
+    // SAFETY: `localtime_r` writes into a caller-owned `tm` and, unlike
+    // `localtime`, touches no shared static, so it is safe to call from any
+    // thread. The pointers are both valid for the call.
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            return 0;
+        }
+        (tm.tm_hour.clamp(0, 23) as u32) * 60 + tm.tm_min.clamp(0, 59) as u32
+    }
+}
+
+/// Parse a `HH:MM` bound into minutes since midnight.
+fn parse_hhmm(text: &str) -> Option<u32> {
+    let (h, m) = text.trim().split_once(':')?;
+    let h: u32 = h.trim().parse().ok()?;
+    let m: u32 = m.trim().parse().ok()?;
+    (h < 24 && m < 60).then_some(h * 60 + m)
+}
+
+/// Whether `now` falls in `[start, stop)`, wrapping over midnight when the
+/// start is later than the stop — which is the normal case for an off-peak
+/// window like 22:00 to 06:00. `None` when either bound will not parse.
+fn in_window(now: u32, start: &str, stop: &str) -> Option<bool> {
+    let start = parse_hhmm(start)?;
+    let stop = parse_hhmm(stop)?;
+    // Equal bounds would otherwise mean "never", which no one sets on purpose.
+    if start == stop {
+        return Some(true);
+    }
+    Some(if start < stop {
+        now >= start && now < stop
+    } else {
+        now >= start || now < stop
+    })
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+
+    #[test]
+    fn bounds_parse_or_are_refused() {
+        assert_eq!(parse_hhmm("22:00"), Some(22 * 60));
+        assert_eq!(parse_hhmm(" 6:05 "), Some(6 * 60 + 5));
+        assert_eq!(parse_hhmm("00:00"), Some(0));
+        assert_eq!(parse_hhmm("24:00"), None, "hour 24 is not a time of day");
+        assert_eq!(parse_hhmm("12:60"), None);
+        assert_eq!(parse_hhmm("noon"), None);
+        assert_eq!(parse_hhmm(""), None);
+    }
+
+    #[test]
+    fn a_daytime_window_contains_only_its_own_hours() {
+        let (start, stop) = ("09:00", "17:00");
+        assert_eq!(in_window(9 * 60, start, stop), Some(true), "the start is inside");
+        assert_eq!(in_window(12 * 60, start, stop), Some(true));
+        assert_eq!(in_window(17 * 60, start, stop), Some(false), "the stop is outside");
+        assert_eq!(in_window(8 * 60 + 59, start, stop), Some(false));
+        assert_eq!(in_window(2 * 60, start, stop), Some(false));
+    }
+
+    /// The case the feature exists for: downloading overnight.
+    #[test]
+    fn an_overnight_window_wraps_past_midnight() {
+        let (start, stop) = ("22:00", "06:00");
+        assert_eq!(in_window(23 * 60, start, stop), Some(true));
+        assert_eq!(in_window(0, start, stop), Some(true), "midnight is inside");
+        assert_eq!(in_window(5 * 60 + 59, start, stop), Some(true));
+        assert_eq!(in_window(6 * 60, start, stop), Some(false));
+        assert_eq!(in_window(12 * 60, start, stop), Some(false));
+    }
+
+    /// Equal bounds read as "all day". The alternative is a window that is
+    /// never open, which pauses every download forever and looks like a bug.
+    #[test]
+    fn equal_bounds_mean_always() {
+        assert_eq!(in_window(3 * 60, "08:00", "08:00"), Some(true));
+    }
+
+    /// Unparseable bounds must not resolve to "closed": the caller does
+    /// nothing on `None`, rather than pausing everything the user has.
+    #[test]
+    fn junk_bounds_decide_nothing() {
+        assert_eq!(in_window(60, "", "06:00"), None);
+        assert_eq!(in_window(60, "22:00", "later"), None);
+    }
+
+    #[test]
+    fn the_local_clock_is_a_time_of_day() {
+        assert!(local_minutes() < 24 * 60);
+    }
+}
+
 /// The bundle identifier this app used before it was renamed to `spool`.
 const LEGACY_ID: &str = "com.saikarthik.fetchd";
 
@@ -582,6 +683,43 @@ pub fn run() {
                 loop {
                     interval.tick().await;
                     flush_state.flush_if_dirty();
+                }
+            });
+
+            // Transfer only inside the configured window, when there is one.
+            let schedule_state = Arc::clone(&state);
+            let schedule_app = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                // Edge-triggered: the window opening resumes and the window
+                // closing pauses, and in between the user's own pause and
+                // resume are left alone. Level-triggering would re-pause a
+                // download the user had just started by hand.
+                let mut was_inside: Option<bool> = None;
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    interval.tick().await;
+                    let settings = schedule_state.settings();
+                    if !settings.schedule_enabled {
+                        was_inside = None;
+                        continue;
+                    }
+                    let Some(inside) =
+                        in_window(local_minutes(), &settings.schedule_start, &settings.schedule_stop)
+                    else {
+                        continue; // unparseable bounds: do nothing rather than guess
+                    };
+                    if was_inside == Some(inside) {
+                        continue;
+                    }
+                    was_inside = Some(inside);
+                    if inside {
+                        schedule_state.resume_all();
+                        state::pump(&schedule_app, &schedule_state);
+                    } else {
+                        schedule_state.pause_all();
+                        state::emit_queue(&schedule_app, &schedule_state);
+                    }
                 }
             });
 

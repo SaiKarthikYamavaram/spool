@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Folder, Gauge, Monitor, Moon, Power, ShieldAlert, Sun, Video } from "lucide-react";
+import { Clock, Folder, Gauge, Monitor, Moon, Power, ShieldAlert, Sun, Video } from "lucide-react";
 import { api, type Settings } from "../lib/api";
 import { applyTheme } from "../lib/theme";
 import { cn } from "cn";
@@ -232,6 +232,62 @@ export function SettingsView() {
             Applies to file downloads and to yt-dlp. Takes effect on the next
             download; transfers already running keep their current connection.
           </p>
+        </div>
+      </Section>
+
+      <Section icon={<Clock className="size-3.5" />} title="Schedule">
+        <Label className="flex items-center gap-2 font-normal">
+          <Switch
+            checked={settings.schedule_enabled}
+            onCheckedChange={(v) => update({ schedule_enabled: v }, true)}
+          />
+          Only download between these times
+        </Label>
+        <div className="grid grid-cols-2 gap-3 sm:gap-4">
+          <div className="space-y-1.5">
+            <Label>Start</Label>
+            <Input
+              type="time"
+              value={settings.schedule_start}
+              disabled={!settings.schedule_enabled}
+              onChange={(e) => update({ schedule_start: e.currentTarget.value }, true)}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label>Stop</Label>
+            <Input
+              type="time"
+              value={settings.schedule_stop}
+              disabled={!settings.schedule_enabled}
+              onChange={(e) => update({ schedule_stop: e.currentTarget.value }, true)}
+            />
+          </div>
+        </div>
+        <p className="text-sm text-muted-foreground">
+          Transfers pause when the window closes and resume when it opens. A start
+          later than the stop runs overnight. Pausing or resuming by hand inside the
+          window is left alone.
+        </p>
+
+        <div className="space-y-1.5">
+          <Label>When every download has finished</Label>
+          <Select
+            value={settings.on_all_done || "none"}
+            onValueChange={(v) => update({ on_all_done: v }, true)}
+          >
+            <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="none">Do nothing</SelectItem>
+              <SelectItem value="quit">Quit spool</SelectItem>
+              <SelectItem value="shutdown">Shut the computer down</SelectItem>
+            </SelectContent>
+          </Select>
+          {settings.on_all_done === "shutdown" && (
+            <p className="text-sm text-destructive">
+              The machine powers off once the last download finishes. Anything else
+              you have open goes with it.
+            </p>
+          )}
         </div>
       </Section>
 

@@ -47,6 +47,12 @@ export type Settings = {
   run_in_background: boolean;
   start_on_login: boolean;
   start_minimised: boolean;
+  schedule_enabled: boolean;
+  /// Local `HH:MM`. A start later than the stop wraps over midnight.
+  schedule_start: string;
+  schedule_stop: string;
+  /// "none" | "quit" | "shutdown", once every download has finished.
+  on_all_done: string;
 };
 
 /// Payload of `download://confirm`: a captured URL awaiting the add dialog.

@@ -358,6 +358,22 @@ function App() {
     [report],
   );
 
+  /// A link dragged out of a browser and dropped on the window. It arrives as
+  /// `text/uri-list`, or as plain text from anything that does not set it.
+  /// Tauri's own drag-drop handler is off (see tauri.conf.json), which is what
+  /// lets the webview see the event at all.
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    const text =
+      e.dataTransfer.getData("text/uri-list") || e.dataTransfer.getData("text/plain");
+    // Whatever else was dragged (a file, an image, a selection) is not a
+    // download, so a drop with no link in it is simply ignored.
+    const links = text.split(/\s+/).filter((l) => /^https?:\/\//i.test(l));
+    if (links.length === 0) return;
+    setPendingToken(null);
+    setPendingMulti(links.length > 1);
+    setPendingUrl(links.join("\n"));
+  }, []);
   const handleSelect = useCallback(
     (id: string, extend: boolean) => {
       setSelected((prev) => selection.toggle(prev, order, id, extend));
@@ -442,7 +458,11 @@ function App() {
   const title = category === "all" ? QUEUE_TITLE[queue] : `${QUEUE_TITLE[queue]} · ${CATEGORY_TITLE[category]}`;
 
   return (
-    <div className="relative flex h-screen flex-col overflow-hidden">
+    <div
+      className="relative flex h-screen flex-col overflow-hidden"
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={handleDrop}
+    >
       {/* Ambient glow. Purely decorative, so hidden from assistive tech and
           pinned behind everything else. Gentle pastel sheen in light mode, luminous in dark mode. */}
       <div aria-hidden="true" className="pointer-events-none fixed -top-40 -left-40 -z-10 size-[28rem] rounded-full bg-primary/8 dark:bg-primary/25 blur-3xl" />

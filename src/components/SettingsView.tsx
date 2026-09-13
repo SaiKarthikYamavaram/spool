@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Clock, Folder, Gauge, Monitor, Moon, Power, ShieldAlert, Sun, Video } from "lucide-react";
+import { Clipboard, Clock, Folder, Gauge, Monitor, Moon, Power, ShieldAlert, Sun, Video } from "lucide-react";
 import { api, type Settings } from "../lib/api";
 import { applyTheme } from "../lib/theme";
 import { cn } from "cn";
@@ -289,6 +289,20 @@ export function SettingsView() {
             </p>
           )}
         </div>
+      </Section>
+
+      <Section icon={<Clipboard className="size-3.5" />} title="Clipboard">
+        <Label className="flex items-center gap-2 font-normal">
+          <Switch
+            checked={settings.clipboard_watch}
+            onCheckedChange={(v) => update({ clipboard_watch: v }, true)}
+          />
+          Offer to download links copied to the clipboard
+        </Label>
+        <p className="text-sm text-muted-foreground">
+          Copying an http or https link opens the add dialog with it filled in.
+          Links already in the queue are ignored.
+        </p>
       </Section>
 
       <Section icon={<Power className="size-3.5" />} title="Startup & background">

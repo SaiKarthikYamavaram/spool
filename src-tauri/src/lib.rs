@@ -17,7 +17,7 @@ use std::time::Duration;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, State, WindowEvent,
+    AppHandle, Emitter, Manager, State, WindowEvent,
 };
 
 use state::{AddOptions, AppState, DownloadView, Settings};
@@ -586,6 +586,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        // Read from the backend only (the clipboard watcher), so the webview
+        // needs no clipboard permission of its own.
+        .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             let handle = app.handle().clone();
             let data_dir = handle.path().app_data_dir()?;
@@ -720,6 +723,57 @@ pub fn run() {
                         schedule_state.pause_all();
                         state::emit_queue(&schedule_app, &schedule_state);
                     }
+                }
+            });
+
+            // Clipboard watcher: copying a link is how a download usually
+            // starts, so offer it rather than making the user paste it back.
+            let clip_state = Arc::clone(&state);
+            let clip_app = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                use tauri_plugin_clipboard_manager::ClipboardExt;
+
+                // Seeded with whatever is on the clipboard at launch, so
+                // enabling the setting does not immediately offer something
+                // copied hours ago.
+                let mut last = clip_app.clipboard().read_text().unwrap_or_default();
+                let mut interval = tokio::time::interval(Duration::from_millis(1500));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    interval.tick().await;
+                    if !clip_state.settings().clipboard_watch {
+                        // Still track the text: turning the setting on should
+                        // not fire on whatever was copied while it was off.
+                        last = clip_app.clipboard().read_text().unwrap_or_default();
+                        continue;
+                    }
+                    let Ok(text) = clip_app.clipboard().read_text() else { continue };
+                    if text == last {
+                        continue;
+                    }
+                    last = text.clone();
+
+                    let url = text.trim();
+                    if crate::download::validate_url(url).is_err() || clip_state.has_url(url) {
+                        continue;
+                    }
+                    // The same path the extension's "ask before download" uses:
+                    // park it and let the add dialog collect the answers.
+                    let token = clip_state.stash_pending(state::PendingAdd {
+                        url: url.to_string(),
+                        session: None,
+                        force_video: false,
+                        added_at: queue::now_secs(),
+                    });
+                    show_main(&clip_app);
+                    let _ = clip_app.emit(
+                        "download://confirm",
+                        state::ConfirmRequest {
+                            token,
+                            url: url.to_string(),
+                            video: false,
+                        },
+                    );
                 }
             });
 

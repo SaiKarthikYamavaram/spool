@@ -53,6 +53,7 @@ export type Settings = {
   schedule_stop: string;
   /// "none" | "quit" | "shutdown", once every download has finished.
   on_all_done: string;
+  clipboard_watch: boolean;
 };
 
 /// Payload of `download://confirm`: a captured URL awaiting the add dialog.

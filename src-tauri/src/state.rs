@@ -99,6 +99,9 @@ pub struct Settings {
     /// or "shutdown" (powers the machine off).
     #[serde(default)]
     pub on_all_done: String,
+    /// Watch the system clipboard and offer to download any URL copied to it.
+    #[serde(default)]
+    pub clipboard_watch: bool,
 }
 
 /// Serde needs a function for a non-`false` bool default.
@@ -130,6 +133,7 @@ impl Default for Settings {
             schedule_start: "22:00".into(),
             schedule_stop: "06:00".into(),
             on_all_done: "none".into(),
+            clipboard_watch: false,
         }
     }
 }

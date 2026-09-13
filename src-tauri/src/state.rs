@@ -564,12 +564,19 @@ impl AppState {
             Some(d) => PathBuf::from(d),
             None => self.download_dir(app)?,
         };
+        // `https://user:pass@host/file` authenticates, but the credentials
+        // travel as a header from here on: the URL below is displayed, copied
+        // and duplicate-checked, and a password belongs in none of that.
+        let (auth, stripped) = download::split_userinfo(url);
+        let url = stripped.as_str();
+
         let custom_name = opts.name.as_deref().map(str::trim).filter(|n| !n.is_empty());
         let settings = self.settings();
         // A folder chosen for this download is taken literally; category
         // sorting only shapes the default location.
         let categorize = settings.categorize && explicit_dir.is_none();
-        let session = self.session_for(url, captured.clone());
+        let mut session = self.session_for(url, captured.clone());
+        session.auth = auth;
 
         let plan = if force_video
             || crate::ytdlp::is_video_site(url)
@@ -606,7 +613,7 @@ impl AppState {
         let id = self.next_id();
         let mut entry = Download::new(id.clone(), plan);
         // Only persist a non-default session; a plain download carries none.
-        if session.cookie.is_some() || session.referer.is_some() {
+        if session.cookie.is_some() || session.referer.is_some() || session.auth.is_some() {
             entry.session = Some(session);
         }
         entry.quality = opts.quality.filter(|q| !q.trim().is_empty());
@@ -1577,6 +1584,7 @@ mod tests {
             cookie: Some("cf_clearance=live".into()),
             referer: Some("https://example.com/page".into()),
             proxy: None,
+            auth: None,
         };
         let session = state.session_for("https://example.com/a.zip", Some(captured));
         assert_eq!(session.cookie.as_deref(), Some("cf_clearance=live"), "the file must not win");

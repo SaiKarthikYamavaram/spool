@@ -187,6 +187,8 @@ fn session_from(req: &AddRequest) -> Session {
         referer: req.referer.clone().filter(|s| !s.is_empty()),
         // Filled in from settings by `session_for`.
         proxy: None,
+        // Credentials come from the URL's own userinfo, stripped at add time.
+        auth: None,
     }
 }
 

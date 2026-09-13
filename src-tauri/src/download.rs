@@ -102,6 +102,12 @@ pub struct Session {
     /// Proxy URL applied to both clients; `None` is a direct connection.
     #[serde(default)]
     pub proxy: Option<String>,
+    /// HTTP Basic credentials as `user:password`, taken from a URL written
+    /// `https://user:pass@host/file`. Kept on the session rather than in the
+    /// stored URL so a resume still authenticates and the UI never displays
+    /// the password.
+    #[serde(default)]
+    pub auth: Option<String>,
 }
 
 impl Default for Session {
@@ -111,6 +117,7 @@ impl Default for Session {
             cookie: None,
             referer: None,
             proxy: None,
+            auth: None,
         }
     }
 }
@@ -146,6 +153,20 @@ fn browser_headers(session: &Session) -> reqwest::header::HeaderMap {
     if let Some(referer) = &session.referer {
         if let Ok(value) = HeaderValue::from_str(referer) {
             headers.insert(REFERER, value);
+        }
+    }
+
+    // HTTP Basic, from credentials the URL carried. Sent up front rather than
+    // after a 401: reqwest would have to replay the request, and a segmented
+    // download would pay that round trip once per connection.
+    if let Some(auth) = &session.auth {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(auth);
+        if let Ok(value) = HeaderValue::from_str(&format!("Basic {encoded}")) {
+            // Marked sensitive so it is redacted from any header debug dump.
+            let mut value = value;
+            value.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, value);
         }
     }
 
@@ -281,6 +302,92 @@ pub fn validate_url(raw: &str) -> Result<Url, String> {
         "http" | "https" => Ok(url),
         other => Err(format!("unsupported scheme `{other}` (only http/https)")),
     }
+}
+
+#[cfg(test)]
+mod userinfo_tests {
+    use super::*;
+
+    #[test]
+    fn an_ordinary_url_is_untouched() {
+        let (auth, url) = split_userinfo("https://example.com/a.zip");
+        assert!(auth.is_none());
+        assert_eq!(url, "https://example.com/a.zip");
+    }
+
+    #[test]
+    fn credentials_move_out_of_the_url() {
+        let (auth, url) = split_userinfo("https://bob:hunter2@example.com/a.zip");
+        assert_eq!(auth.as_deref(), Some("bob:hunter2"));
+        assert_eq!(url, "https://example.com/a.zip", "the password must not stay in the URL");
+    }
+
+    /// A password is percent-encoded in a URL but plain in the header.
+    #[test]
+    fn credentials_are_percent_decoded() {
+        let (auth, _) = split_userinfo("https://bob:p%40ss%3Aword@example.com/a");
+        assert_eq!(auth.as_deref(), Some("bob:p@ss:word"));
+    }
+
+    #[test]
+    fn a_username_with_no_password_still_authenticates() {
+        let (auth, url) = split_userinfo("https://token@example.com/a");
+        assert_eq!(auth.as_deref(), Some("token:"));
+        assert_eq!(url, "https://example.com/a");
+    }
+
+    /// Unparseable input belongs to `validate_url` to reject, not to this.
+    #[test]
+    fn junk_passes_straight_through() {
+        let (auth, url) = split_userinfo("not a url");
+        assert!(auth.is_none());
+        assert_eq!(url, "not a url");
+    }
+
+    #[test]
+    fn the_header_carries_the_credentials() {
+        let session = Session { auth: Some("bob:hunter2".into()), ..Session::default() };
+        let headers = browser_headers(&session);
+        let value = headers.get(reqwest::header::AUTHORIZATION).expect("Authorization must be set");
+        // base64("bob:hunter2")
+        assert_eq!(value.to_str().unwrap(), "Basic Ym9iOmh1bnRlcjI=");
+        assert!(value.is_sensitive(), "credentials must not appear in a header dump");
+    }
+
+    #[test]
+    fn no_credentials_means_no_header() {
+        let headers = browser_headers(&Session::default());
+        assert!(headers.get(reqwest::header::AUTHORIZATION).is_none());
+    }
+}
+
+/// Split `https://user:pass@host/file` into the credentials and the URL with
+/// them removed.
+///
+/// Credentials belong in an `Authorization` header, not in the stored URL: the
+/// URL is displayed in the row, copied by "Copy URL" and matched by the
+/// duplicate check, and a password has no business in any of those. Returns
+/// `None` for the ordinary case of a URL with no userinfo.
+pub fn split_userinfo(raw: &str) -> (Option<String>, String) {
+    let Ok(mut url) = Url::parse(raw) else {
+        return (None, raw.to_string());
+    };
+    if url.username().is_empty() && url.password().is_none() {
+        return (None, raw.to_string());
+    }
+    // Percent-decoded, because that is what the header carries: a password
+    // written `p%40ss` in a URL is `p@ss` to the server.
+    let user = percent_decode(url.username());
+    let auth = match url.password() {
+        Some(pass) => format!("{user}:{}", percent_decode(pass)),
+        None => format!("{user}:"),
+    };
+    // Both setters only fail on a URL that cannot have a host (`mailto:`),
+    // which `validate_url` rejects anyway; leaving the userinfo in place is
+    // the safe outcome either way.
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    (Some(auth), url.to_string())
 }
 
 // ---------------------------------------------------------------------------

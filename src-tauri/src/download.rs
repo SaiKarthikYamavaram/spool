@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fs4::tokio::AsyncFileExt;
 use futures_util::StreamExt;
@@ -55,6 +55,26 @@ pub const MAX_SEGMENTS: u32 = 8;
 /// only when each half is at least this big: a fresh connection's handshake
 /// costs more than a smaller tail saves.
 pub const MIN_SPLIT_BYTES: u64 = 1024 * 1024;
+
+/// A split must leave the old connection at least this many setup times of
+/// work in the half it gives away. A fresh connection spends its setup (time
+/// to first byte) before moving anything, then still has to ramp up.
+const SPLIT_SETUP_FACTOR: f64 = 2.0;
+
+/// Whether giving away half of `left` bytes pays for a new connection: the
+/// old one would need longer for that half than the new one needs to start.
+/// With no speed measured yet there is nothing to weigh, so split.
+fn worth_splitting(left: u64, rate: Option<f64>, setup_secs: f64) -> bool {
+    match rate {
+        Some(rate) => (left as f64 / 2.0) / rate > SPLIT_SETUP_FACTOR * setup_secs,
+        None => true,
+    }
+}
+
+fn median(mut xs: Vec<f64>) -> Option<f64> {
+    xs.sort_by(f64::total_cmp);
+    xs.get(xs.len() / 2).copied()
+}
 
 /// Refuse to start unless this much space remains free beyond the file itself.
 const DISK_HEADROOM: u64 = 64 * 1024 * 1024;
@@ -638,6 +658,9 @@ pub struct SegmentProgress {
     /// connection takes over its tail, so it is read under the same lock that
     /// guards the claim frontier.
     bounds: Mutex<Bounds>,
+    /// Time to first byte of this segment's latest request, in ms; 0 until
+    /// one has answered.
+    ttfb_ms: AtomicU64,
 }
 
 /// `frontier` is the absolute offset up to which the worker has claimed bytes
@@ -648,6 +671,10 @@ struct Bounds {
     start: u64,
     end: u64,
     frontier: u64,
+    /// When the segment was placed and how many bytes it had then, so its
+    /// average speed can be measured.
+    since: Instant,
+    base: u64,
 }
 
 impl Default for SegmentProgress {
@@ -661,7 +688,8 @@ impl SegmentProgress {
         SegmentProgress {
             live: AtomicU64::new(offset),
             durable: AtomicU64::new(offset),
-            bounds: Mutex::new(Bounds { start: 0, end: u64::MAX, frontier: 0 }),
+            bounds: Mutex::new(Bounds { start: 0, end: u64::MAX, frontier: 0, since: Instant::now(), base: offset }),
+            ttfb_ms: AtomicU64::new(0),
         }
     }
 
@@ -673,7 +701,8 @@ impl SegmentProgress {
 
     fn place(&self, start: u64, end: u64) {
         let mut b = self.bounds.lock().unwrap();
-        *b = Bounds { start, end, frontier: start + self.live() };
+        let live = self.live();
+        *b = Bounds { start, end, frontier: start + live, since: Instant::now(), base: live };
     }
 
     fn start(&self) -> u64 {
@@ -682,6 +711,27 @@ impl SegmentProgress {
 
     fn end(&self) -> u64 {
         self.bounds.lock().unwrap().end
+    }
+
+    fn note_ttfb(&self, waited: Duration) {
+        self.ttfb_ms.store(waited.as_millis().max(1) as u64, Ordering::Relaxed);
+    }
+
+    fn ttfb(&self) -> Option<f64> {
+        match self.ttfb_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(ms as f64 / 1000.0),
+        }
+    }
+
+    /// Average bytes/s since this segment was placed, once there is enough to
+    /// say anything. Stalls and retry backoff count against it, which is the
+    /// point: a stuck segment is exactly the one worth splitting.
+    fn rate(&self) -> Option<f64> {
+        let b = self.bounds.lock().unwrap();
+        let got = self.live().saturating_sub(b.base);
+        let secs = b.since.elapsed().as_secs_f64();
+        (got > 0 && secs >= 0.25).then(|| got as f64 / secs)
     }
 
     /// Reserve up to `len` bytes at the write position, clamped to the
@@ -811,14 +861,28 @@ impl Progress {
         self.placed.store(true, Ordering::Relaxed);
     }
 
-    /// Split the segment with the most bytes left and return the index of the
-    /// new counter covering its upper half.
+    /// Split the segment with the most bytes left whose split still pays for
+    /// a new connection, and return the index of the counter covering its
+    /// upper half. On a far host a fresh connection spends over a second
+    /// before its first byte, so handing it a small tail slows the finish.
     fn split_largest(&self) -> Option<usize> {
         let mut counters = self.counters.lock().unwrap();
-        let victim = Arc::clone(counters.iter().max_by_key(|c| c.remaining())?);
-        let (start, end) = victim.split()?;
-        counters.push(Arc::new(SegmentProgress::with_range(start, end)));
-        Some(counters.len() - 1)
+        let setup = median(counters.iter().filter_map(|c| c.ttfb()).collect()).unwrap_or(0.0);
+        // A segment still waiting on its first byte has no speed yet; assume
+        // the typical one rather than treating it as infinitely slow.
+        let typical = median(counters.iter().filter_map(|c| c.rate()).collect());
+        let mut candidates: Vec<_> = counters.iter().map(|c| (c.remaining(), Arc::clone(c))).collect();
+        candidates.sort_by_key(|(left, _)| std::cmp::Reverse(*left));
+        for (left, victim) in candidates {
+            if !worth_splitting(left, victim.rate().or(typical), setup) {
+                continue;
+            }
+            if let Some((start, end)) = victim.split() {
+                counters.push(Arc::new(SegmentProgress::with_range(start, end)));
+                return Some(counters.len() - 1);
+            }
+        }
+        None
     }
 
     /// Set the first counter to an absolute byte count (yt-dlp path).
@@ -1246,10 +1310,12 @@ async fn stream_range(
         request = request.header(IF_RANGE, v.clone());
     }
 
+    let asked = Instant::now();
     let response = request
         .send()
         .await
         .map_err(|e| SegErr::Retryable(format!("request failed: {e}")))?;
+    done.note_ttfb(asked.elapsed());
 
     let status = response.status();
     if status == StatusCode::OK {
@@ -2231,6 +2297,20 @@ mod tests {
         let seg = SegmentProgress::with_range(0, 2 * MIN_SPLIT_BYTES - 2);
         assert_eq!(seg.split(), None);
         assert_eq!(SegmentProgress::default().split(), None);
+    }
+
+    #[test]
+    fn small_tails_are_not_worth_a_slow_new_connection() {
+        let two_mib = 2 * 1024 * 1024;
+        // Far host, 1.3 s before a new connection's first byte. 2 MiB left at
+        // 1.4 MB/s: the half would take 0.75 s, less than 2 setups.
+        assert!(!worth_splitting(two_mib, Some(1.4e6), 1.3));
+        // 40 MiB left at the same speed: the half takes 15 s. Worth it.
+        assert!(worth_splitting(20 * two_mib, Some(1.4e6), 1.3));
+        // The same small tail on a LAN (10 ms setup) is worth it.
+        assert!(worth_splitting(two_mib, Some(1.4e6), 0.01));
+        // Nothing measured yet: split, as before.
+        assert!(worth_splitting(two_mib, None, 1.3));
     }
 
     #[test]

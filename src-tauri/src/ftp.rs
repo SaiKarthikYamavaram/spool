@@ -192,6 +192,9 @@ where
         .open(&plan.part_path)
         .await
         .map_err(|e| format!("cannot open {}: {e}", plan.part_path.display()))?;
+    file.set_len(offset)
+        .await
+        .map_err(|e| format!("cannot set size on {}: {e}", plan.part_path.display()))?;
     file.seek(std::io::SeekFrom::Start(offset))
         .await
         .map_err(|e| format!("cannot seek {}: {e}", plan.part_path.display()))?;
@@ -207,7 +210,13 @@ where
         let read = tokio::select! {
             biased;
             _ = token.cancelled() => break Err("cancelled".to_string()),
-            read = stream.read(&mut buf) => read,
+            read = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                stream.read(&mut buf),
+            ) => match read {
+                Ok(r) => r,
+                Err(_) => break Err("transfer stalled: read timed out after 30s".to_string()),
+            },
         };
         let n = match read {
             Ok(0) => break Ok(()),

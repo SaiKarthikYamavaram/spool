@@ -102,6 +102,10 @@ pub fn matches_filter(url: &Url, filter: &str) -> bool {
         .filter(|e| !e.is_empty())
         .collect();
 
+    if url.scheme() == "magnet" {
+        return wanted.is_empty() || wanted.iter().any(|w| w == "torrent" || w == "magnet");
+    }
+
     match extension_of(url) {
         Some(ext) => {
             if wanted.is_empty() {
@@ -170,13 +174,15 @@ pub async fn crawl(
             // Relative links resolve against the page they were found on, not
             // against the URL the crawl started from.
             let Ok(link) = page.join(&raw) else { continue };
-            if !matches!(link.scheme(), "http" | "https") {
+            if !matches!(link.scheme(), "http" | "https" | "ftp" | "magnet") {
                 continue;
             }
 
             let mut link = link;
-            // A fragment is a position on a page, never a different file.
-            link.set_fragment(None);
+            if link.scheme() != "magnet" {
+                // A fragment is a position on a page, never a different file.
+                link.set_fragment(None);
+            }
 
             if matches_filter(&link, filter) {
                 let as_str = link.as_str().to_string();
@@ -194,6 +200,8 @@ pub async fn crawl(
 
 /// Fetch one page, or `None` for anything that is not readable HTML.
 async fn fetch_page(client: &Client, url: &Url) -> Option<String> {
+    use futures_util::StreamExt;
+
     let response = tokio::time::timeout(PAGE_TIMEOUT, client.get(url.clone()).send())
         .await
         .ok()?
@@ -212,8 +220,28 @@ async fn fetch_page(client: &Client, url: &Url) -> Option<String> {
         return None;
     }
 
-    let body = tokio::time::timeout(PAGE_TIMEOUT, response.text()).await.ok()?.ok()?;
-    Some(body.chars().take(MAX_BODY).collect())
+    let mut stream = response.bytes_stream();
+    let mut body_bytes = Vec::new();
+
+    tokio::time::timeout(PAGE_TIMEOUT, async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.ok()?;
+            let remaining = MAX_BODY.saturating_sub(body_bytes.len());
+            if remaining == 0 {
+                break;
+            }
+            let take = chunk.len().min(remaining);
+            body_bytes.extend_from_slice(&chunk[..take]);
+            if body_bytes.len() >= MAX_BODY {
+                break;
+            }
+        }
+        Some(())
+    })
+    .await
+    .ok()??;
+
+    Some(String::from_utf8_lossy(&body_bytes).into_owned())
 }
 
 #[cfg(test)]
@@ -293,5 +321,17 @@ mod tests {
         assert!(is_followable(&url("https://e.test/pub/"), &base, ""));
         assert!(!is_followable(&url("https://other.test/more.html"), &base, ""));
         assert!(!is_followable(&url("https://e.test/a.zip"), &base, ""), "a file is not a page");
+    }
+
+    #[test]
+    fn matches_ftp_and_magnets() {
+        assert!(matches_filter(&url("ftp://example.com/archive.zip"), ""));
+        assert!(matches_filter(&url("ftp://example.com/archive.zip"), "zip"));
+        assert!(!matches_filter(&url("ftp://example.com/archive.tar"), "zip"));
+
+        assert!(matches_filter(&url("magnet:?xt=urn:btih:abc"), ""));
+        assert!(matches_filter(&url("magnet:?xt=urn:btih:abc"), "torrent"));
+        assert!(matches_filter(&url("magnet:?xt=urn:btih:abc"), "magnet"));
+        assert!(!matches_filter(&url("magnet:?xt=urn:btih:abc"), "zip"));
     }
 }

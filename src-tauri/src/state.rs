@@ -455,6 +455,17 @@ impl AppState {
             .any(|d| d.url == url && !d.is_terminal())
     }
 
+    /// Whether any entry in the queue carries this URL, including finished ones.
+    /// Used by the clipboard watcher so copying a completed download's URL
+    /// from spool does not offer to download it again.
+    pub fn has_any_url(&self, url: &str) -> bool {
+        self.queue
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|d| d.url == url)
+    }
+
     fn set_status(&self, id: &str, status: Status, error: Option<String>) {
         let mut queue = self.queue.lock().unwrap();
         if let Some(d) = queue.iter_mut().find(|d| d.id == id) {
@@ -1450,11 +1461,21 @@ fn finish_action(app: &AppHandle, state: &Arc<AppState>) {
 
     state.shutdown();
     if action == "shutdown" {
-        // Ask the session manager rather than the kernel: `systemctl poweroff`
-        // is the one command that works without root on a systemd desktop.
+        // Ask the session manager or platform shutdown utility rather than
+        // the kernel: `systemctl poweroff` works without root on a systemd
+        // desktop; shutdown.exe /s on Windows; osascript on macOS.
         // A failure is reported and the app still quits — refusing to exit
         // because the machine would not power off helps no one.
-        if let Err(e) = std::process::Command::new("systemctl").arg("poweroff").spawn() {
+        #[cfg(target_os = "linux")]
+        let res = std::process::Command::new("systemctl").arg("poweroff").spawn();
+        #[cfg(target_os = "windows")]
+        let res = std::process::Command::new("shutdown").args(["/s", "/t", "0"]).spawn();
+        #[cfg(target_os = "macos")]
+        let res = std::process::Command::new("osascript").args(["-e", "tell app \"System Events\" to shut down"]).spawn();
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+        let res: std::io::Result<std::process::Child> = Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "unsupported platform"));
+
+        if let Err(e) = res {
             eprintln!("spool: could not power the machine off: {e}");
         }
     }
@@ -1714,12 +1735,16 @@ mod tests {
         let url = state.queue.lock().unwrap()[0].url.clone();
 
         assert!(state.has_url(&url));
+        assert!(state.has_any_url(&url));
         state.set_status("u1", Status::Completed, None);
         assert!(!state.has_url(&url));
+        assert!(state.has_any_url(&url), "completed entry is still known to has_any_url");
         state.set_status("u1", Status::Failed, None);
         assert!(!state.has_url(&url));
+        assert!(state.has_any_url(&url), "failed entry is still known to has_any_url");
         state.set_status("u1", Status::Paused, None);
         assert!(state.has_url(&url), "a paused download is still in the queue");
+        assert!(state.has_any_url(&url));
     }
 
     #[test]

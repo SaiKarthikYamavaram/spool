@@ -27,7 +27,7 @@ fn local_path(raw: &str) -> Option<PathBuf> {
     let raw = raw.trim();
     let path = match reqwest::Url::parse(raw) {
         Ok(url) if url.scheme() == "file" => url.to_file_path().ok()?,
-        _ if raw.starts_with('/') => PathBuf::from(raw),
+        _ if Path::new(raw).is_absolute() => PathBuf::from(raw),
         _ => return None,
     };
     let is_torrent = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("torrent"));

@@ -25,6 +25,24 @@ describe("expandPattern", () => {
     ]);
   });
 
+  it("does not pad when the user wrote no leading zeros like [1-50]", () => {
+    const res = expandPattern("https://e.test/img[1-50].jpg");
+    expect(res).toHaveLength(50);
+    expect(res[0]).toBe("https://e.test/img1.jpg");
+    expect(res[8]).toBe("https://e.test/img9.jpg");
+    expect(res[9]).toBe("https://e.test/img10.jpg");
+    expect(res[49]).toBe("https://e.test/img50.jpg");
+  });
+
+  it("pads to two digits when a leading zero is typed like [01-50]", () => {
+    const res = expandPattern("https://e.test/img[01-50].jpg");
+    expect(res).toHaveLength(50);
+    expect(res[0]).toBe("https://e.test/img01.jpg");
+    expect(res[8]).toBe("https://e.test/img09.jpg");
+    expect(res[9]).toBe("https://e.test/img10.jpg");
+    expect(res[49]).toBe("https://e.test/img50.jpg");
+  });
+
   it("counts down when the range does", () => {
     expect(expandPattern("https://e.test/[3-1].bin")).toEqual([
       "https://e.test/3.bin",

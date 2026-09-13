@@ -25,6 +25,7 @@ export function DetailModal({
     row.status === "downloading" && liveBytes !== undefined ? liveBytes : row.downloaded;
   const total = row.total ?? liveTotal ?? null;
   const percent = total ? Math.min(100, (downloaded / total) * 100) : null;
+  const [actionError, setActionError] = useState<string | null>(null);
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
@@ -111,13 +112,26 @@ export function DetailModal({
 
         {row.status === "completed" && <Checksum id={row.id} />}
 
+        {actionError && <p className="text-sm text-destructive">{actionError}</p>}
+
         <div className="flex flex-wrap gap-2">
           {row.status === "completed" && (
             <>
-              <Button onClick={() => api.openFile(row.path)}>
+              <Button
+                onClick={() => {
+                  setActionError(null);
+                  api.openFile(row.path).catch((e) => setActionError(String(e)));
+                }}
+              >
                 <ExternalLink /> Open file
               </Button>
-              <Button variant="outline" onClick={() => api.revealFile(row.path)}>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setActionError(null);
+                  api.revealFile(row.path).catch((e) => setActionError(String(e)));
+                }}
+              >
                 <Folder /> Open folder
               </Button>
             </>

@@ -332,6 +332,7 @@ async fn encode_thumb(path: &std::path::Path) -> Option<String> {
 /// `libc::localtime_r` rather than a date crate: the only question being asked
 /// is what the wall clock says, and libc is already a dependency. It is also
 /// the only thing that knows the machine's timezone and its DST rules.
+#[cfg(unix)]
 fn local_minutes() -> u32 {
     // SAFETY: `localtime_r` writes into a caller-owned `tm` and, unlike
     // `localtime`, touches no shared static, so it is safe to call from any
@@ -344,6 +345,23 @@ fn local_minutes() -> u32 {
         }
         (tm.tm_hour.clamp(0, 23) as u32) * 60 + tm.tm_min.clamp(0, 59) as u32
     }
+}
+
+#[cfg(windows)]
+fn local_minutes() -> u32 {
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_s(&mut tm, &now) != 0 {
+            return 0;
+        }
+        (tm.tm_hour.clamp(0, 23) as u32) * 60 + tm.tm_min.clamp(0, 59) as u32
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn local_minutes() -> u32 {
+    0
 }
 
 /// Parse a `HH:MM` bound into minutes since midnight.
@@ -806,7 +824,7 @@ pub fn run() {
                     last = text.clone();
 
                     let url = text.trim();
-                    if !is_supported_link(url) || clip_state.has_url(url) {
+                    if !is_supported_link(url) || clip_state.has_any_url(url) {
                         continue;
                     }
                     offer_link(&clip_app, &clip_state, url);

@@ -300,7 +300,7 @@ export function SettingsView() {
           Offer to download links copied to the clipboard
         </Label>
         <p className="text-sm text-muted-foreground">
-          Copying an http or https link opens the add dialog with it filled in.
+          Copying a downloadable link (HTTP, FTP, or magnet) opens the add dialog with it filled in.
           Links already in the queue are ignored.
         </p>
       </Section>

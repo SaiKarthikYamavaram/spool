@@ -144,6 +144,8 @@ function App() {
   const [pendingMulti, setPendingMulti] = useState(false);
   // The link grabber, which feeds its results into that same dialog.
   const [spiderOpen, setSpiderOpen] = useState(false);
+  // Whether an external link or file is being dragged over the window.
+  const [isWindowDragOver, setIsWindowDragOver] = useState(false);
 
   // Live bytes arrive far more often than the queue snapshot, so they are kept
   // out of React state and merged at render time.
@@ -379,13 +381,16 @@ function App() {
   /// lets the webview see the event at all.
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
+    setIsWindowDragOver(false);
     // A row dragged to reorder and let go between rows is not a link.
     if (e.dataTransfer.types.includes(ROW_DRAG)) return;
     const text =
       e.dataTransfer.getData("text/uri-list") || e.dataTransfer.getData("text/plain");
     // Whatever else was dragged (a file, an image, a selection) is not a
     // download, so a drop with no link in it is simply ignored.
-    const links = text.split(/\s+/).filter((l) => /^(https?:\/\/|ftp:\/\/|magnet:\?)/i.test(l));
+    const links = text
+      .split(/\s+/)
+      .filter((l) => /^(https?:\/\/|ftp:\/\/|magnet:\?)/i.test(l));
     if (links.length === 0) return;
     setPendingToken(null);
     setPendingMulti(links.length > 1);
@@ -477,9 +482,28 @@ function App() {
   return (
     <div
       className="relative flex h-screen flex-col overflow-hidden"
-      onDragOver={(e) => e.preventDefault()}
+      onDragOver={(e) => {
+        e.preventDefault();
+        if (!e.dataTransfer.types.includes(ROW_DRAG)) {
+          setIsWindowDragOver(true);
+        }
+      }}
+      onDragLeave={(e) => {
+        if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+        setIsWindowDragOver(false);
+      }}
       onDrop={handleDrop}
     >
+      {/* Visual drop indicator for external files and links */}
+      {isWindowDragOver && (
+        <div className="pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm border-2 border-dashed border-primary m-2 rounded-xl transition-all">
+          <div className="flex flex-col items-center gap-2 text-primary">
+            <Download className="size-10 animate-bounce" />
+            <p className="text-sm font-semibold">Drop links to download</p>
+          </div>
+        </div>
+      )}
+
       {/* Ambient glow. Purely decorative, so hidden from assistive tech and
           pinned behind everything else. Gentle pastel sheen in light mode, luminous in dark mode. */}
       <div aria-hidden="true" className="pointer-events-none fixed -top-40 -left-40 -z-10 size-[28rem] rounded-full bg-primary/8 dark:bg-primary/25 blur-3xl" />
@@ -924,12 +948,17 @@ const Row = memo(function Row({
   const poster = usePoster(row);
   const preview = row.thumbnail ?? poster;
 
+  const [isOver, setIsOver] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+
   return (
     <Card
       className={cn(
         "flex-row items-center gap-2.5 sm:gap-3 bg-card/95 dark:bg-card/75 p-2.5 sm:p-3 backdrop-blur-sm transition-all shadow-[0_1px_3px_rgba(0,0,0,0.05),0_1px_2px_rgba(0,0,0,0.02)] border-border/80 hover:-translate-y-0.5 hover:shadow-[0_8px_20px_-4px_rgba(0,0,0,0.08)] dark:hover:shadow-primary/5",
         selected ? "border-primary bg-accent/30 dark:bg-accent/40 ring-1 ring-primary/25" : "hover:border-primary/50",
         selectMode && "cursor-pointer",
+        isDragging && "opacity-40 scale-[0.99] border-dashed border-primary/60",
+        isOver && "ring-2 ring-primary border-primary bg-primary/10 shadow-lg -translate-y-0.5",
       )}
       // In selection mode the whole row is the target, so the tile is an
       // indicator rather than the only thing you can hit.
@@ -938,13 +967,31 @@ const Row = memo(function Row({
       // selection mode, where a press means "pick this row".
       draggable={!selectMode}
       onDragStart={(e) => {
+        setIsDragging(true);
         e.dataTransfer.setData(ROW_DRAG, row.id);
         e.dataTransfer.effectAllowed = "move";
       }}
+      onDragEnd={() => {
+        setIsDragging(false);
+      }}
+      onDragEnter={(e) => {
+        if (e.dataTransfer.types.includes(ROW_DRAG)) {
+          e.preventDefault();
+          setIsOver(true);
+        }
+      }}
       onDragOver={(e) => {
-        if (e.dataTransfer.types.includes(ROW_DRAG)) e.preventDefault();
+        if (e.dataTransfer.types.includes(ROW_DRAG)) {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "move";
+        }
+      }}
+      onDragLeave={(e) => {
+        if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+        setIsOver(false);
       }}
       onDrop={(e) => {
+        setIsOver(false);
         const from = e.dataTransfer.getData(ROW_DRAG);
         if (!from) return;
         e.preventDefault();

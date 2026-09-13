@@ -142,7 +142,9 @@ export function AddDialog({
       if (!picked) return;
       // As a file:// URL, so a space in the path cannot split it into two
       // links. Appended, so a file can join links already pasted.
-      const link = "file://" + picked.split("/").map(encodeURIComponent).join("/");
+      const normalized = picked.replace(/\\/g, "/");
+      const prefix = normalized.startsWith("/") ? "file://" : "file:///";
+      const link = prefix + normalized.split("/").map(encodeURIComponent).join("/");
       setValue((v) => (v.trim() ? `${v.trimEnd()}\n${link}` : link));
     } catch (e) {
       setError(String(e));
@@ -151,7 +153,7 @@ export function AddDialog({
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
-    if (busy) return;
+    if (busy || links.length === 0 || patternError) return;
     setBusy(true);
     setError(null);
 

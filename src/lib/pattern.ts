@@ -38,8 +38,12 @@ export function expandPattern(url: string): string[] {
     );
   }
 
-  // The literal width the user typed, so "007" stays three digits wide.
-  const width = Math.max(rawStart.length, rawEnd.length);
+  // The literal width the user typed, so "007" stays three digits wide,
+  // but "1-50" without leading zeros pads to none.
+  const hasLeadingZero =
+    (rawStart.length > 1 && rawStart.startsWith("0")) ||
+    (rawEnd.length > 1 && rawEnd.startsWith("0"));
+  const width = hasLeadingZero ? Math.max(rawStart.length, rawEnd.length) : 0;
   const step = end >= start ? 1 : -1;
   const out: string[] = [];
   for (let n = start; step > 0 ? n <= end : n >= end; n += step) {

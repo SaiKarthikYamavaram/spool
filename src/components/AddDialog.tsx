@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Download, Folder } from "lucide-react";
 import { api, type AddOptions } from "../lib/api";
+import { expandAll } from "../lib/pattern";
 import { Button } from "./ui/button";
 import { Checkbox } from "./ui/checkbox";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "./ui/dialog";
@@ -94,7 +95,19 @@ export function AddDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const links = splitUrls(value);
+  // `file[001-050].jpg` is fifty links. Expansion happens here rather than in
+  // the backend so the dialog can show the real count before anything is
+  // queued — and refuse an obvious typo instead of adding 10 million rows.
+  let links: string[];
+  let patternError: string | null = null;
+  try {
+    links = expandAll(splitUrls(value));
+  } catch (e) {
+    links = [];
+    patternError = e instanceof Error ? e.message : String(e);
+  }
+  const typed = splitUrls(value);
+  const expanded = links.length > typed.length;
   const batch = links.length > 1;
   // A list stays a list: shrinking the box back to one line the moment the
   // second URL is deleted is not helpful while editing.
@@ -202,6 +215,14 @@ export function AddDialog({
                 autoFocus={!locked}
               />
             )}
+            {patternError ? (
+              <p className="text-sm text-destructive">{patternError}</p>
+            ) : expanded ? (
+              <p className="text-sm text-muted-foreground">
+                Expanded to {links.length} links. A range like{" "}
+                <code>file[001-050].jpg</code> downloads every file in it.
+              </p>
+            ) : null}
           </div>
 
           <div className="space-y-1.5">
@@ -271,7 +292,7 @@ export function AddDialog({
 
           <DialogFooter>
             <Button type="button" variant="outline" onClick={dismiss}>Cancel</Button>
-            <Button type="submit" disabled={busy || links.length === 0}>
+            <Button type="submit" disabled={busy || links.length === 0 || Boolean(patternError)}>
               <Download />{" "}
               {busy
                 ? "Adding…"

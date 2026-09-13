@@ -21,9 +21,25 @@ use crate::download::{self, DownloadPlan, Engine, Progress};
 /// this is a display cadence, not a transfer one.
 const POLL: std::time::Duration = std::time::Duration::from_millis(1000);
 
-/// Whether this URL belongs to the torrent engine: a magnet link, or an
-/// `http(s)` URL pointing at a `.torrent` file.
+/// A `.torrent` file on disk, written as a plain absolute path or as a
+/// `file://` URL — which is how a desktop entry's `%U` hands a file over.
+fn local_path(raw: &str) -> Option<PathBuf> {
+    let raw = raw.trim();
+    let path = match reqwest::Url::parse(raw) {
+        Ok(url) if url.scheme() == "file" => url.to_file_path().ok()?,
+        _ if raw.starts_with('/') => PathBuf::from(raw),
+        _ => return None,
+    };
+    let is_torrent = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("torrent"));
+    is_torrent.then_some(path)
+}
+
+/// Whether this URL belongs to the torrent engine: a magnet link, an
+/// `http(s)` URL pointing at a `.torrent` file, or a `.torrent` on disk.
 pub fn is_torrent_url(raw: &str) -> bool {
+    if local_path(raw).is_some() {
+        return true;
+    }
     let raw = raw.trim();
     let lower = raw.to_ascii_lowercase();
     if lower.starts_with("magnet:") {
@@ -61,6 +77,13 @@ pub fn suggested_name(raw: &str) -> String {
         return "torrent".to_string();
     }
 
+    if let Some(path) = local_path(raw) {
+        return path
+            .file_stem()
+            .and_then(|stem| download::sanitize_filename(&stem.to_string_lossy()))
+            .unwrap_or_else(|| "torrent".to_string());
+    }
+
     reqwest::Url::parse(raw)
         .ok()
         .and_then(|url| {
@@ -82,12 +105,19 @@ pub fn prepare(url: &str, dest_dir: &Path, custom_name: Option<&str>) -> Result<
     if !is_torrent_url(url) {
         return Err(format!("not a torrent: {url}"));
     }
+    // A file on disk is stored as its plain path whichever way it was written,
+    // and a missing one is refused now rather than after the row is queued.
+    let url = match local_path(url) {
+        Some(path) if !path.is_file() => return Err(format!("no such file: {}", path.display())),
+        Some(path) => path.display().to_string(),
+        None => url.trim().to_string(),
+    };
     let name = custom_name
         .and_then(download::sanitize_filename)
-        .unwrap_or_else(|| suggested_name(url));
+        .unwrap_or_else(|| suggested_name(&url));
 
     Ok(DownloadPlan {
-        url: url.trim().to_string(),
+        url,
         final_path: dest_dir.join(&name),
         // librqbit manages its own partial files inside the output folder.
         part_path: dest_dir.join(&name),
@@ -131,8 +161,18 @@ where
         ..Default::default()
     };
 
+    let source = match local_path(&plan.url) {
+        // Read on every run rather than kept in the plan: the file is small,
+        // and the plan stays a plain string like every other engine's.
+        Some(path) => AddTorrent::from_bytes(
+            tokio::fs::read(&path)
+                .await
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))?,
+        ),
+        None => AddTorrent::from_url(plan.url.clone()),
+    };
     let response = session
-        .add_torrent(AddTorrent::from_url(plan.url.clone()), Some(options))
+        .add_torrent(source, Some(options))
         .await
         .map_err(|e| format!("cannot add torrent: {e:#}"))?;
     let handle = response
@@ -260,5 +300,34 @@ mod tests {
     #[test]
     fn a_non_torrent_is_refused() {
         assert!(prepare("https://example.com/a.zip", Path::new("/tmp"), None).is_err());
+    }
+
+    #[test]
+    fn a_torrent_file_on_disk_is_claimed() {
+        assert!(is_torrent_url("/home/me/Downloads/debian.torrent"));
+        assert!(is_torrent_url("file:///home/me/My%20Files/debian.TORRENT"));
+        assert!(!is_torrent_url("/home/me/notes.txt"));
+        assert!(!is_torrent_url("relative/debian.torrent"), "only absolute paths");
+    }
+
+    /// The add dialog hands a picked file over as a `file://` URL, so a space
+    /// in the path cannot split it into two links.
+    #[test]
+    fn a_file_url_is_stored_as_its_path() {
+        let dir = std::env::temp_dir().join(format!("spool-torrent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("My Distro.torrent");
+        std::fs::write(&file, b"d4:infoe").unwrap();
+        let url = reqwest::Url::from_file_path(&file).unwrap().to_string();
+
+        let plan = prepare(&url, Path::new("/tmp/dl"), None).unwrap();
+        assert_eq!(plan.url, file.display().to_string());
+        assert_eq!(plan.final_path, Path::new("/tmp/dl/My Distro"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_torrent_file_is_refused_up_front() {
+        assert!(prepare("/nonexistent/spool/x.torrent", Path::new("/tmp"), None).is_err());
     }
 }

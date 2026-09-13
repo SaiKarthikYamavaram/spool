@@ -87,9 +87,20 @@ export const api = {
   addPending: (token: string, options?: AddOptions) =>
     invoke<string>("add_pending", { token, options: options ?? null }),
   cancelPending: (token: string) => invoke<void>("cancel_pending", { token }),
+  /// Requests parked before the window was listening (a link spool was
+  /// launched with, or a capture during startup), oldest first.
+  pendingConfirms: () => invoke<ConfirmRequest[]>("pending_confirms"),
   /// Native folder picker for the add dialog's save location.
   pickFolder: async (defaultPath?: string) => {
     const picked = await openDialog({ directory: true, multiple: false, defaultPath });
+    return typeof picked === "string" ? picked : null;
+  },
+  /// Native picker for a `.torrent` file on disk.
+  pickTorrent: async () => {
+    const picked = await openDialog({
+      multiple: false,
+      filters: [{ name: "Torrent", extensions: ["torrent"] }],
+    });
     return typeof picked === "string" ? picked : null;
   },
   importUrls: (text: string) => invoke<string[]>("import_urls", { text }),

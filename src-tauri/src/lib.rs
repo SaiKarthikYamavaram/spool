@@ -208,6 +208,13 @@ fn move_download(app: AppHandle, state: Shared<'_>, id: String, delta: i32) {
     state::pump(&app, &state);
 }
 
+/// Requests parked before the window was listening: a link spool was launched
+/// with, or an extension capture during startup.
+#[tauri::command]
+fn pending_confirms(state: Shared<'_>) -> Vec<state::ConfirmRequest> {
+    state.pending_requests()
+}
+
 /// Hash a finished file so it can be checked against a published checksum.
 ///
 /// Computed on demand rather than during the transfer: most downloads are
@@ -583,8 +590,16 @@ pub fn run() {
     tauri::Builder::default()
         // Must be registered first: a second launch is intercepted here and
         // focuses the running window instead of starting another process.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             show_main(app);
+            // A second launch carrying a link is the desktop handing one over
+            // (a magnet clicked in a browser, a `.torrent` opened from the
+            // file manager), so it goes to the running window.
+            if let Some(state) = app.try_state::<Arc<AppState>>() {
+                for link in argv.iter().skip(1).filter(|a| is_supported_link(a)) {
+                    offer_link(app, &state, link);
+                }
+            }
         }))
         // Remembers the window's size and position across launches. Without
         // it every launch reopens at the configured default, which is smaller
@@ -645,6 +660,13 @@ pub fn run() {
                 if let Some(window) = handle.get_webview_window("main") {
                     let _ = window.hide();
                 }
+            }
+
+            // Launched by the desktop with a link. The window is not listening
+            // yet, so the emit is lost, but the request stays parked and the
+            // frontend collects it through `pending_confirms` when it loads.
+            for link in std::env::args().skip(1).filter(|a| is_supported_link(a)) {
+                offer_link(&handle, &state, &link);
             }
 
             // System tray: left-click restores the window; the menu offers an
@@ -836,6 +858,7 @@ pub fn run() {
             rename_download,
             bulk_action,
             move_download,
+            pending_confirms,
             hash_file,
             pause_all,
             resume_all,

@@ -115,10 +115,20 @@ Exec=$BIN_DIR/$APP %U
 Icon=$APP
 Terminal=false
 Categories=Network;FileTransfer;
-Keywords=download;downloader;idm;video;yt-dlp;
+Keywords=download;downloader;idm;video;yt-dlp;torrent;magnet;
+MimeType=x-scheme-handler/magnet;application/x-bittorrent;
 StartupWMClass=spool
 EOF
 say "Installed $APP_DIR/$APP.desktop"
+
+# Open magnet links and .torrent files with spool. Only claimed as the default
+# when nothing else is, so an installed torrent client keeps its links.
+command -v update-desktop-database >/dev/null && update-desktop-database "$APP_DIR" 2>/dev/null || true
+if command -v xdg-mime >/dev/null; then
+  for mime in x-scheme-handler/magnet application/x-bittorrent; do
+    [ -n "$(xdg-mime query default "$mime" 2>/dev/null)" ] || xdg-mime default "$APP.desktop" "$mime"
+  done
+fi
 
 command -v update-desktop-database >/dev/null && update-desktop-database "$APP_DIR" 2>/dev/null || true
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -qtf "$ICON_ROOT" 2>/dev/null || true

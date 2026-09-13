@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Download, Folder } from "lucide-react";
+import { Download, Folder, Magnet } from "lucide-react";
 import { api, type AddOptions } from "../lib/api";
 import { expandAll } from "../lib/pattern";
 import { Button } from "./ui/button";
@@ -136,6 +136,19 @@ export function AddDialog({
     }
   }
 
+  async function openTorrent() {
+    try {
+      const picked = await api.pickTorrent();
+      if (!picked) return;
+      // As a file:// URL, so a space in the path cannot split it into two
+      // links. Appended, so a file can join links already pasted.
+      const link = "file://" + picked.split("/").map(encodeURIComponent).join("/");
+      setValue((v) => (v.trim() ? `${v.trimEnd()}\n${link}` : link));
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     if (busy) return;
@@ -223,6 +236,11 @@ export function AddDialog({
                 <code>file[001-050].jpg</code> downloads every file in it.
               </p>
             ) : null}
+            {!locked && (
+              <Button type="button" variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={openTorrent}>
+                <Magnet /> Open a .torrent file
+              </Button>
+            )}
           </div>
 
           <div className="space-y-1.5">

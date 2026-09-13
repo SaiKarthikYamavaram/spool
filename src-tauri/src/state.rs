@@ -590,6 +590,22 @@ impl AppState {
         self.pending.lock().unwrap().remove(token)
     }
 
+    /// Every parked request still waiting for an answer, oldest first.
+    pub fn pending_requests(&self) -> Vec<ConfirmRequest> {
+        let now = queue::now_secs();
+        let map = self.pending.lock().unwrap();
+        let mut live: Vec<_> = map
+            .iter()
+            .filter(|(_, p)| now.saturating_sub(p.added_at) < PENDING_TTL_SECS)
+            .map(|(token, p)| {
+                let request = ConfirmRequest { token: token.clone(), url: p.url.clone(), video: p.force_video };
+                (p.added_at, request)
+            })
+            .collect();
+        live.sort_by_key(|(at, _)| *at);
+        live.into_iter().map(|(_, request)| request).collect()
+    }
+
     /// Add a URL typed into the app. Uses the manual cookies.txt session, if
     /// any.
     pub async fn add(&self, app: &AppHandle, url: &str) -> Result<String, String> {
@@ -1796,6 +1812,23 @@ mod tests {
         assert!(state.take_pending(&a).is_none(), "a token must not be redeemable twice");
         assert!(state.take_pending("never-issued").is_none());
         assert!(state.take_pending(&b).is_some());
+    }
+
+    /// A link spool was launched with is parked before the window listens, so
+    /// the frontend has to be able to find it afterwards.
+    #[test]
+    fn parked_requests_can_be_listed_without_consuming_them() {
+        let state = app();
+        let token = state.stash_pending(PendingAdd {
+            url: "magnet:?xt=urn:btih:abc".into(),
+            session: None,
+            force_video: false,
+            added_at: crate::queue::now_secs(),
+        });
+        let listed = state.pending_requests();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].token, token);
+        assert!(state.take_pending(&token).is_some(), "listing must not consume the request");
     }
 
     /// A dialog closed by shutting the window never answers. Without the sweep

@@ -180,6 +180,17 @@ function App() {
     }).catch(() => {});
   }, []);
 
+  // A request parked before the confirm listener existed — spool launched
+  // with a magnet or a .torrent — would otherwise never open its dialog.
+  useEffect(() => {
+    api.pendingConfirms().then((parked) => {
+      const last = parked[parked.length - 1];
+      if (!last) return;
+      setPendingToken(last.token);
+      setPendingUrl(last.url);
+    }).catch(() => {});
+  }, []);
+
   // Auto-collapse sidebar on compact displays (< 768px) to maximize download workspace
   useEffect(() => {
     const handleResize = () => {

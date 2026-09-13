@@ -33,6 +33,29 @@ pub fn show_main(app: &AppHandle) {
 
 type Shared<'a> = State<'a, Arc<AppState>>;
 
+/// Whether some engine can take this link: http(s), FTP, or a torrent
+/// (magnet, `.torrent` URL, or `.torrent` on disk).
+fn is_supported_link(url: &str) -> bool {
+    download::validate_url(url).is_ok() || ftp::is_ftp_url(url) || torrent::is_torrent_url(url)
+}
+
+/// Offer a link that arrived from outside the window — the clipboard, or the
+/// desktop handing over a magnet or a `.torrent` — through the add dialog, the
+/// same path the extension's "ask before download" uses.
+fn offer_link(app: &AppHandle, state: &AppState, url: &str) {
+    let token = state.stash_pending(state::PendingAdd {
+        url: url.to_string(),
+        session: None,
+        force_video: false,
+        added_at: queue::now_secs(),
+    });
+    show_main(app);
+    let _ = app.emit(
+        "download://confirm",
+        state::ConfirmRequest { token, url: url.to_string(), video: false },
+    );
+}
+
 #[tauri::command]
 async fn add_download(
     app: AppHandle,
@@ -754,26 +777,10 @@ pub fn run() {
                     last = text.clone();
 
                     let url = text.trim();
-                    if crate::download::validate_url(url).is_err() || clip_state.has_url(url) {
+                    if !is_supported_link(url) || clip_state.has_url(url) {
                         continue;
                     }
-                    // The same path the extension's "ask before download" uses:
-                    // park it and let the add dialog collect the answers.
-                    let token = clip_state.stash_pending(state::PendingAdd {
-                        url: url.to_string(),
-                        session: None,
-                        force_video: false,
-                        added_at: queue::now_secs(),
-                    });
-                    show_main(&clip_app);
-                    let _ = clip_app.emit(
-                        "download://confirm",
-                        state::ConfirmRequest {
-                            token,
-                            url: url.to_string(),
-                            video: false,
-                        },
-                    );
+                    offer_link(&clip_app, &clip_state, url);
                 }
             });
 

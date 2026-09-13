@@ -368,7 +368,7 @@ function App() {
       e.dataTransfer.getData("text/uri-list") || e.dataTransfer.getData("text/plain");
     // Whatever else was dragged (a file, an image, a selection) is not a
     // download, so a drop with no link in it is simply ignored.
-    const links = text.split(/\s+/).filter((l) => /^https?:\/\//i.test(l));
+    const links = text.split(/\s+/).filter((l) => /^(https?:\/\/|ftp:\/\/|magnet:\?)/i.test(l));
     if (links.length === 0) return;
     setPendingToken(null);
     setPendingMulti(links.length > 1);

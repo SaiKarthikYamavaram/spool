@@ -196,13 +196,13 @@ async function grabFromPage(tab, mode, referer) {
           return Array.from(document.querySelectorAll("a[href]"))
             .filter((a) => range.intersectsNode(a))
             .map((a) => a.href)
-            .filter((u) => /^https?:/i.test(u));
+            .filter((u) => /^(https?|ftp):|^magnet:\?/i.test(u));
         }
         const q = m === "images" ? "img[src]" : "a[href]";
         const attr = m === "images" ? "src" : "href";
         return Array.from(document.querySelectorAll(q))
           .map((el) => el[attr])
-          .filter((u) => /^https?:/i.test(u));
+          .filter((u) => /^(https?|ftp):|^magnet:\?/i.test(u));
       },
       args: [mode],
     });
@@ -214,6 +214,9 @@ async function grabFromPage(tab, mode, referer) {
   const urls = [...new Set(results?.[0]?.result || [])];
   const settings = await getSettings();
   const wanted = urls.filter((u) => {
+    // A magnet has no host to exclude and no filename to classify; a page's
+    // magnet links are always torrents, which is what the grab is for.
+    if (/^magnet:/i.test(u)) return true;
     if (isExcluded(u, settings)) return false;
     const t = classify("", filenameFromUrl(u));
     return t && settings.types[t];

@@ -2,7 +2,8 @@ import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useSta
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import {
-  Archive, BookOpen, Captions, Check, CircleAlert, CircleCheckBig, Code2, Copy,
+  Archive, ArrowDown, ArrowUp, BookOpen, Captions, Check, ChevronsUp, CircleAlert,
+  CircleCheckBig, Code2, Copy,
   Disc, Download, ExternalLink, File, FileText, Folder, Image, ListChecks,
   Loader2, Magnet, MoreVertical, Music, Network, Package, Pause, Pencil, Play, Plus,
   Presentation, RotateCcw, Search, Sheet, Trash2, Type as TypeIcon,
@@ -350,6 +351,13 @@ function App() {
   const handleOpen = useCallback((id: string) => setDetailId(id), []);
   const handleDelete = useCallback((id: string) => setDeleteId(id), []);
   const handleRename = useCallback((id: string) => setRenameId(id), []);
+  /// Queue position is priority — the next free slot takes the first waiting
+  /// entry — so moving a row up is how a download is made to go next.
+  const handleMove = useCallback(
+    (id: string, delta: number) => api.move(id, delta).catch(report),
+    [report],
+  );
+
   const handleSelect = useCallback(
     (id: string, extend: boolean) => {
       setSelected((prev) => selection.toggle(prev, order, id, extend));
@@ -657,6 +665,7 @@ function App() {
                   onOpen={handleOpen}
                   onDelete={handleDelete}
                   onRename={handleRename}
+                  onMove={handleMove}
                   onFail={report}
                   selectMode={selectMode}
                   selected={selected.ids.has(row.id)}
@@ -837,7 +846,7 @@ function hostnameOf(url: string): string | null {
 }
 
 const Row = memo(function Row({
-  row, liveBytes, liveTotal, speed, onOpen, onDelete, onRename,
+  row, liveBytes, liveTotal, speed, onOpen, onDelete, onRename, onMove,
   selectMode, selected, onSelect, onFail,
 }: {
   row: DownloadView;
@@ -847,6 +856,8 @@ const Row = memo(function Row({
   onOpen: (id: string) => void;
   onDelete: (id: string) => void;
   onRename: (id: string) => void;
+  /// Negative moves the row up the queue; a large magnitude clamps to an end.
+  onMove: (id: string, delta: number) => void;
   selectMode: boolean;
   selected: boolean;
   onSelect: (id: string, extend: boolean) => void;
@@ -1035,6 +1046,22 @@ const Row = memo(function Row({
             <DropdownMenuItem onClick={() => navigator.clipboard.writeText(row.url)}>
               <Copy /> Copy URL
             </DropdownMenuItem>
+            {/* Reordering only means anything while a download is still
+                waiting for a slot — a finished one has no queue left. */}
+            {row.status !== "completed" && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onClick={() => onMove(row.id, -9999)}>
+                  <ChevronsUp /> Move to top
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => onMove(row.id, -1)}>
+                  <ArrowUp /> Move up
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => onMove(row.id, 1)}>
+                  <ArrowDown /> Move down
+                </DropdownMenuItem>
+              </>
+            )}
             {/* A running transfer holds its `.part` open, so renaming needs a
                 pause first — hide the option rather than offer a guaranteed
                 error. */}

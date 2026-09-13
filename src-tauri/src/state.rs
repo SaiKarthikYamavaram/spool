@@ -760,6 +760,25 @@ impl AppState {
         Ok(())
     }
 
+    /// Move an entry up (`delta` negative) or down the queue.
+    ///
+    /// The queue is a list and `claim_next` takes the first waiting entry in
+    /// it, so position *is* priority — reordering the vector is the whole
+    /// feature, no priority field needed. A large delta clamps to the end,
+    /// which is how "move to top" is expressed.
+    pub fn move_entry(&self, id: &str, delta: i32) {
+        let mut queue = self.queue.lock().unwrap();
+        let Some(from) = queue.iter().position(|d| d.id == id) else { return };
+        let to = (from as i64 + delta as i64).clamp(0, queue.len() as i64 - 1) as usize;
+        if to == from {
+            return;
+        }
+        let entry = queue.remove(from);
+        queue.insert(to, entry);
+        drop(queue);
+        self.save_queue();
+    }
+
     /// Ask a running transfer to stop, leaving the partial file in place.
     pub fn pause(&self, id: &str) {
         if let Some(active) = self.active.lock().unwrap().remove(id) {

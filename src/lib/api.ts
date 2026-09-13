@@ -103,6 +103,10 @@ export const api = {
   retry: (id: string) => invoke<void>("retry_download", { id }),
   remove: (id: string, deleteFile: boolean) =>
     invoke<void>("remove_download", { id, deleteFile }),
+  /// Reorder the queue: position is priority, so this is what moves a
+  /// download ahead of the others. Negative is up; a big magnitude clamps to
+  /// an end ("to the top").
+  move: (id: string, delta: number) => invoke<void>("move_download", { id, delta }),
   pauseAll: () => invoke<void>("pause_all"),
   resumeAll: () => invoke<void>("resume_all"),
   /// A poster frame for a finished video, as a data: URI. Null for anything

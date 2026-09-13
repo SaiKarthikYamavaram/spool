@@ -175,6 +175,16 @@ fn rename_download(app: AppHandle, state: Shared<'_>, id: String, name: String) 
     Ok(())
 }
 
+/// Move an entry through the queue. Negative moves it up; a large magnitude
+/// clamps to an end, which is how the menu spells "to the top".
+#[tauri::command]
+fn move_download(app: AppHandle, state: Shared<'_>, id: String, delta: i32) {
+    state.move_entry(&id, delta);
+    // Order is priority, so a move can change what the free slots should be
+    // running — not just what the list looks like.
+    state::pump(&app, &state);
+}
+
 #[tauri::command]
 fn bulk_action(app: AppHandle, state: Shared<'_>, ids: Vec<String>, action: state::BulkAction) {
     state.bulk(&ids, action);
@@ -572,6 +582,7 @@ pub fn run() {
             remove_download,
             rename_download,
             bulk_action,
+            move_download,
             pause_all,
             resume_all,
             video_thumbnail,

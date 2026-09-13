@@ -1,5 +1,6 @@
 mod cookies;
 mod download;
+mod ftp;
 mod queue;
 mod server;
 mod state;

@@ -392,6 +392,7 @@ impl AppState {
                 engine: match d.plan.engine {
                     download::Engine::YtDlp => "ytdlp".into(),
                     download::Engine::Http => "http".into(),
+                    download::Engine::Ftp => "ftp".into(),
                 },
                 }
             })
@@ -605,6 +606,8 @@ impl AppState {
                 dir
             };
             download::video_plan(url, &dir, title, thumbnail, custom_name)?
+        } else if crate::ftp::is_ftp_url(url) {
+            crate::ftp::prepare(url, &session, &dir, categorize, custom_name).await?
         } else {
             let (client, _) = self.clients_for(&session)?;
             download::prepare(&client, url, &dir, settings.segments, categorize, custom_name).await?
@@ -931,7 +934,9 @@ fn spawn_transfer(app: AppHandle, state: Arc<AppState>, entry: Download) {
     tauri::async_runtime::spawn(async move {
         let plan = entry.plan.clone();
 
-        let result: Result<PathBuf, String> = if plan.engine == download::Engine::YtDlp {
+        let result: Result<PathBuf, String> = if plan.engine == download::Engine::Ftp {
+            run_ftp(&app, &state, &entry, &plan, &progress, &id, token.clone()).await
+        } else if plan.engine == download::Engine::YtDlp {
             run_video(
                 &app,
                 &state,
@@ -1047,6 +1052,63 @@ async fn run_http(
         &client,
         &segment_client,
         plan,
+        progress,
+        &throttle,
+        token,
+        move |downloaded, total| {
+            let _ = emitter.emit(
+                "download://progress",
+                ProgressRow { id: row_id.clone(), downloaded, total },
+            );
+        },
+    )
+    .await;
+
+    checkpoint.abort();
+    result
+}
+
+/// The FTP run: one connection, the same periodic checkpoint the HTTP engine
+/// uses so a pause or a crash resumes from a real offset.
+async fn run_ftp(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    entry: &Download,
+    plan: &download::DownloadPlan,
+    progress: &Progress,
+    id: &str,
+    token: CancellationToken,
+) -> Result<PathBuf, String> {
+    let checkpoint = {
+        let state = Arc::clone(state);
+        let id = id.to_string();
+        let progress = progress.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = interval.tick() => {
+                        state.record_progress(&id, &progress);
+                        state.mark_dirty();
+                    }
+                }
+            }
+        })
+    };
+
+    // Credentials reach the engine the same way the HTTP one gets cookies:
+    // on the session stored with the entry.
+    let session = state.session_for(&plan.url, entry.session.clone());
+    let throttle = state.current_throttle();
+    let emitter = app.clone();
+    let row_id = id.to_string();
+
+    let result = crate::ftp::run(
+        plan,
+        &session,
         progress,
         &throttle,
         token,
@@ -1194,7 +1256,9 @@ pub fn emit_queue(app: &AppHandle, state: &Arc<AppState>) {
 fn delete_artifacts(plan: &download::DownloadPlan, partial_only: bool) {
     match plan.engine {
         download::Engine::YtDlp => cleanup_by_stem(&plan.final_path),
-        download::Engine::Http => {
+        // FTP writes the same single `.part` the HTTP engine does, so it is
+        // cleaned the same way.
+        download::Engine::Http | download::Engine::Ftp => {
             let _ = std::fs::remove_file(&plan.part_path);
             if !partial_only {
                 let _ = std::fs::remove_file(&plan.final_path);

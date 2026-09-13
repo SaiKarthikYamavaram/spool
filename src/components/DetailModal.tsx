@@ -61,6 +61,8 @@ export function DetailModal({
             value={
               row.engine === "ytdlp"
                 ? "yt-dlp engine"
+                : row.engine === "ftp"
+                ? "1 (FTP, resumed with REST)"
                 : row.supports_ranges
                   ? `${row.segments} (server supports byte ranges)`
                   : "1 (server has no range support)"

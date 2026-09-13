@@ -405,7 +405,7 @@ fn hex_val(b: u8) -> Option<u8> {
 
 /// Minimal percent-decoder for RFC 5987 `filename*` values and URL path
 /// segments.
-fn percent_decode(s: &str) -> String {
+pub fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -1043,6 +1043,8 @@ pub enum Engine {
     Http,
     /// Delegated to yt-dlp (streaming sites).
     YtDlp,
+    /// Plain FTP, resumed with `REST` (see `ftp.rs`).
+    Ftp,
 }
 
 /// Everything decided before the first byte moves: where the file goes, how

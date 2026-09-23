@@ -342,6 +342,17 @@ function App() {
   const deleteRow = deleteId ? rows.find((r) => r.id === deleteId) ?? null : null;
   const renameRow = renameId ? rows.find((r) => r.id === renameId) ?? null : null;
 
+  // Progress events carry only the running total, and the queue snapshot is
+  // pushed only on status changes, so the per-segment bars would sit frozen.
+  // Poll the snapshot (which reads the live counters) while the modal watches
+  // a running transfer.
+  const detailRunning = detailRow?.status === "downloading";
+  useEffect(() => {
+    if (!detailRunning) return;
+    const timer = setInterval(refresh, 1000);
+    return () => clearInterval(timer);
+  }, [detailRunning, refresh]);
+
   const selectedRows = visible.filter((r) => selected.ids.has(r.id));
   const selectedIds = selectedRows.map((r) => r.id);
   const allVisibleSelected = visible.length > 0 && selectedRows.length === visible.length;

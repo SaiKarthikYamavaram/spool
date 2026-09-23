@@ -65,7 +65,8 @@ pub fn start(app: AppHandle, state: Arc<AppState>) {
         // A bounded pool rather than a thread per request: "download all links"
         // fires one POST per link, and any local process can hit this endpoint,
         // so unbounded spawning would be a cheap way to exhaust threads.
-        let (work_tx, work_rx) = std::sync::mpsc::channel::<(tiny_http::Request, String)>();
+        let (work_tx, work_rx) =
+            std::sync::mpsc::channel::<(tiny_http::Request, String, Option<String>)>();
         let work_rx = Arc::new(std::sync::Mutex::new(work_rx));
         for _ in 0..ADD_WORKERS {
             let rx = Arc::clone(&work_rx);
@@ -73,10 +74,10 @@ pub fn start(app: AppHandle, state: Arc<AppState>) {
             let state = Arc::clone(&state);
             std::thread::spawn(move || loop {
                 let job = { rx.lock().unwrap().recv() };
-                let Ok((request, body)) = job else { return };
+                let Ok((request, body, origin)) = job else { return };
                 let response = match handle_add(&app, &state, &body) {
-                    Ok(id) => cors(Response::from_string(id)),
-                    Err(e) => cors(Response::from_string(e).with_status_code(400)),
+                    Ok(id) => cors(Response::from_string(id), origin.as_deref()),
+                    Err(e) => cors(Response::from_string(e).with_status_code(400), origin.as_deref()),
                 };
                 let _ = request.respond(response);
             });
@@ -85,47 +86,59 @@ pub fn start(app: AppHandle, state: Arc<AppState>) {
         for mut request in server.incoming_requests() {
             // Defence in depth: tiny_http is bound to loopback already, but a
             // request that somehow arrives from off-box is refused rather than
-            // trusted. Any local process can still reach this — an accepted
-            // limitation for a personal tool, matching how IDM's local bridge
-            // works.
-            // ponytail: loopback-only, no auth token; add a token handshake if
-            // this ever runs somewhere multi-user.
+            // trusted.
             if !is_loopback(&request) {
-                let _ = request.respond(cors(Response::empty(403)));
+                let _ = request.respond(Response::empty(403));
+                continue;
+            }
+
+            // Protect against localhost drive-by CSRF / SSRF: reject requests
+            // originating from ordinary web pages (http://, https://, null).
+            // Only browser extension origins or local non-browser tools (no
+            // Origin header, e.g. curl) are permitted.
+            let origin = get_origin(&request);
+            if !is_allowed_origin(origin.as_deref()) {
+                let _ = request.respond(Response::empty(403));
                 continue;
             }
 
             match (request.method(), request.url()) {
                 // Preflight for the extension's cross-origin POST.
                 (Method::Options, _) => {
-                    let _ = request.respond(cors(Response::empty(204)));
+                    let _ = request.respond(cors(Response::empty(204), origin.as_deref()));
                 }
                 // Health check so the extension can tell whether spool is up.
                 (Method::Get, "/ping") => {
-                    let _ = request.respond(cors(Response::from_string("spool")));
+                    let _ = request.respond(cors(Response::from_string("spool"), origin.as_deref()));
                 }
                 (Method::Post, "/add") => {
                     const MAX_BODY: usize = 64 * 1024;
                     let body = match read_body(request.as_reader(), MAX_BODY) {
                         Ok(b) => b,
                         Err(BodyError::TooLarge) => {
-                            let _ = request.respond(cors(Response::from_string("payload too large").with_status_code(413)));
+                            let _ = request.respond(cors(
+                                Response::from_string("payload too large").with_status_code(413),
+                                origin.as_deref(),
+                            ));
                             continue;
                         }
                         Err(BodyError::BadBody) => {
-                            let _ = request.respond(cors(Response::from_string("bad body").with_status_code(400)));
+                            let _ = request.respond(cors(
+                                Response::from_string("bad body").with_status_code(400),
+                                origin.as_deref(),
+                            ));
                             continue;
                         }
                     };
                     // Hand to the worker pool: a video /add blocks on a ~15s
                     // yt-dlp metadata probe, and the accept loop must stay free
                     // to answer /ping meanwhile.
-                    if work_tx.send((request, body)).is_err() {
+                    if work_tx.send((request, body, origin)).is_err() {
                         break; // workers gone; nothing left to serve
                     }
                 }
                 _ => {
-                    let _ = request.respond(cors(Response::empty(404)));
+                    let _ = request.respond(cors(Response::empty(404), origin.as_deref()));
                 }
             }
         }
@@ -141,7 +154,7 @@ enum BodyError {
 /// Read request body up to `max_bytes`. If the incoming stream exceeds
 /// `max_bytes`, returns `TooLarge` even if the cutoff falls in the middle
 /// of a multi-byte UTF-8 character.
-fn read_body<R: Read>(mut reader: R, max_bytes: usize) -> Result<String, BodyError> {
+fn read_body<R: Read>(reader: R, max_bytes: usize) -> Result<String, BodyError> {
     let mut buf = Vec::new();
     let mut limited = reader.take((max_bytes + 1) as u64);
     if limited.read_to_end(&mut buf).is_err() {
@@ -229,6 +242,27 @@ fn session_from(req: &AddRequest) -> Session {
     }
 }
 
+fn get_origin(request: &tiny_http::Request) -> Option<String> {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Origin"))
+        .map(|h| h.value.as_str().to_string())
+}
+
+/// Only allow requests from browser extensions (chrome-extension://, moz-extension://)
+/// or local non-browser tools (no Origin header, e.g. curl/scripts on loopback).
+/// Web pages (http://, https://, null) are rejected to prevent drive-by CSRF / SSRF.
+fn is_allowed_origin(origin: Option<&str>) -> bool {
+    match origin {
+        None => true,
+        Some(o) => {
+            let o = o.trim();
+            o.starts_with("chrome-extension://") || o.starts_with("moz-extension://")
+        }
+    }
+}
+
 fn is_loopback(request: &tiny_http::Request) -> bool {
     match request.remote_addr() {
         Some(addr) => match addr.ip() {
@@ -240,22 +274,30 @@ fn is_loopback(request: &tiny_http::Request) -> bool {
     }
 }
 
-/// The extension's service worker makes a cross-origin request, so every reply
-/// needs permissive CORS or the browser discards it before the extension sees
-/// it. There is nothing secret in these responses (an id or an error string).
-fn cors<R>(response: Response<R>) -> Response<R>
+/// The extension's service worker makes a cross-origin request, so reply
+/// with CORS for verified extension origins. Never send wildcard "*" so
+/// websites cannot reach this endpoint.
+fn cors<R>(response: Response<R>, origin: Option<&str>) -> Response<R>
 where
     R: Read,
 {
-    let allow_origin = Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap();
     let allow_headers =
         Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type"[..]).unwrap();
     let allow_methods =
         Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"POST, GET, OPTIONS"[..]).unwrap();
-    response
-        .with_header(allow_origin)
-        .with_header(allow_headers)
-        .with_header(allow_methods)
+    let mut resp = response.with_header(allow_headers).with_header(allow_methods);
+
+    if let Some(o) = origin {
+        let o = o.trim();
+        if o.starts_with("chrome-extension://") || o.starts_with("moz-extension://") {
+            if let Ok(allow_origin) =
+                Header::from_bytes(&b"Access-Control-Allow-Origin"[..], o.as_bytes())
+            {
+                resp.add_header(allow_origin);
+            }
+        }
+    }
+    resp
 }
 
 #[cfg(test)]
@@ -382,5 +424,48 @@ mod tests {
             r#"{"url":"https://e.test/a","userAgent":"CustomAgent/1.0"}"#,
         ));
         assert_eq!(session.user_agent, "CustomAgent/1.0");
+    }
+
+    #[test]
+    fn origin_filtering_blocks_web_origins_and_allows_extensions() {
+        // Extensions allowed
+        assert!(is_allowed_origin(Some("chrome-extension://abcdefghijklmnop")));
+        assert!(is_allowed_origin(Some("moz-extension://1234-5678-90ab")));
+
+        // Local non-browser CLI allowed
+        assert!(is_allowed_origin(None));
+
+        // Websites and opaque origins rejected
+        assert!(!is_allowed_origin(Some("https://attacker.com")));
+        assert!(!is_allowed_origin(Some("http://evil.com:8080")));
+        assert!(!is_allowed_origin(Some("http://localhost:3000")));
+        assert!(!is_allowed_origin(Some("null")));
+    }
+
+    #[test]
+    fn cors_headers_reflect_extension_origin_only() {
+        let resp = cors(Response::empty(200), Some("chrome-extension://my-ext-id"));
+        let headers = resp.headers();
+        let allow_origin = headers
+            .iter()
+            .find(|h| h.field.equiv("Access-Control-Allow-Origin"));
+        assert_eq!(
+            allow_origin.map(|h| h.value.as_str()),
+            Some("chrome-extension://my-ext-id")
+        );
+
+        let resp_none = cors(Response::empty(200), None);
+        let allow_origin_none = resp_none
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Access-Control-Allow-Origin"));
+        assert!(allow_origin_none.is_none());
+
+        let resp_web = cors(Response::empty(200), Some("https://evil.com"));
+        let allow_origin_web = resp_web
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Access-Control-Allow-Origin"));
+        assert!(allow_origin_web.is_none());
     }
 }

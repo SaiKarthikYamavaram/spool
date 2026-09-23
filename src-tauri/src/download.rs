@@ -526,12 +526,30 @@ pub fn sanitize_filename(raw: &str) -> Option<String> {
         .collect();
 
     // Windows silently drops trailing dots and spaces; do it explicitly so the
-    // name we record matches the name on disk.
-    let name = cleaned.trim().trim_end_matches(['.', ' ']).trim();
+    // name we record matches the name on disk. Strip leading hyphens to prevent
+    // option injection in CLI tools.
+    let name = cleaned
+        .trim()
+        .trim_end_matches(['.', ' '])
+        .trim_start_matches('-')
+        .trim();
 
     if name.is_empty() || name == "." || name == ".." || name.starts_with('.') {
         return None;
     }
+
+    // Windows DOS reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9).
+    // These collide with Win32 legacy device namespaces regardless of extension.
+    const WINDOWS_RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let stem = name.split('.').next().unwrap_or("");
+    if WINDOWS_RESERVED.iter().any(|r| r.eq_ignore_ascii_case(stem)) {
+        return None;
+    }
+
     Some(name.to_string())
 }
 
@@ -1807,6 +1825,24 @@ mod tests {
     #[test]
     fn sanitize_keeps_ordinary_names() {
         assert_eq!(sanitize_filename("archive.tar.gz").as_deref(), Some("archive.tar.gz"));
+    }
+
+    #[test]
+    fn sanitize_rejects_windows_reserved_names() {
+        assert_eq!(sanitize_filename("CON"), None);
+        assert_eq!(sanitize_filename("con.txt"), None);
+        assert_eq!(sanitize_filename("aux.zip"), None);
+        assert_eq!(sanitize_filename("NUL.tar.gz"), None);
+        assert_eq!(sanitize_filename("com1.bin"), None);
+        assert_eq!(sanitize_filename("lpt9"), None);
+        assert_eq!(sanitize_filename("console.txt").as_deref(), Some("console.txt"));
+    }
+
+    #[test]
+    fn sanitize_strips_leading_hyphens() {
+        assert_eq!(sanitize_filename("-output.mp4").as_deref(), Some("output.mp4"));
+        assert_eq!(sanitize_filename("--help.txt").as_deref(), Some("help.txt"));
+        assert_eq!(sanitize_filename("---"), None);
     }
 
     #[test]

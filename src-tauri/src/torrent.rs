@@ -201,7 +201,7 @@ where
         let stats = handle.stats();
 
         if !named {
-            if let Some(name) = handle.name() {
+            if let Some(name) = handle.name().and_then(|n| download::sanitize_filename(&n)) {
                 on_name(&name);
                 named = true;
             }
@@ -226,10 +226,13 @@ where
 
     // Now that the metadata is known, the real output path is too — a
     // multi-file torrent is a folder, a single-file one is the file in it.
-    let final_path = match handle.name() {
-        Some(name) => handle.output_folder().join(name),
-        None => handle.output_folder().to_path_buf(),
-    };
+    // Untrusted metadata must be sanitized and never default to the base
+    // output directory.
+    let final_path = handle
+        .name()
+        .and_then(|n| download::sanitize_filename(&n))
+        .map(|name| handle.output_folder().join(name))
+        .unwrap_or_else(|| plan.final_path.clone());
     Ok(final_path)
 }
 

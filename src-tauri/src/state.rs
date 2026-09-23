@@ -491,11 +491,14 @@ impl AppState {
     /// download is still running, so the row shows the real title instead of the
     /// "…video" placeholder before it finishes.
     fn set_display_name(&self, id: &str, name: &str) {
+        let Some(safe_name) = download::sanitize_filename(name) else {
+            return;
+        };
         let changed = {
             let mut queue = self.queue.lock().unwrap();
             match queue.iter_mut().find(|d| d.id == id) {
                 Some(d) => {
-                    let next = d.plan.final_path.with_file_name(name);
+                    let next = d.plan.final_path.with_file_name(&safe_name);
                     let changed = d.plan.final_path != next;
                     d.plan.final_path = next;
                     changed
@@ -883,6 +886,75 @@ impl AppState {
     pub fn resume(&self, id: &str) {
         self.set_status(id, Status::Queued, None);
         self.save_queue();
+    }
+
+    /// Queue a finished download to be fetched again from byte 0, replacing
+    /// the file on disk.
+    ///
+    /// HTTP and FTP re-probe, so a file that changed on the server comes down
+    /// at its new size, and write a fresh `.part` that is renamed over the old
+    /// file only once it completes — a failed redownload keeps the old copy.
+    /// yt-dlp skips any output it finds already there, so that is deleted up
+    /// front. A torrent is content-addressed: fetching it again yields the same
+    /// bytes, so it is refused.
+    pub async fn redownload(&self, id: &str) -> Result<(), String> {
+        let (mut plan, captured) = {
+            let queue = self.queue.lock().unwrap();
+            let d = queue
+                .iter()
+                .find(|d| d.id == id)
+                .ok_or_else(|| "that download is gone".to_string())?;
+            if d.status != Status::Completed {
+                return Err("only a finished download can be downloaded again".into());
+            }
+            (d.plan.clone(), d.session.clone())
+        };
+        let session = self.session_for(&plan.url, captured);
+
+        match plan.engine {
+            download::Engine::Http => {
+                let (client, _) = self.clients_for(&session)?;
+                let url = download::validate_url(&plan.url)?;
+                let info = download::probe(&client, &url).await?;
+                if let (Some(total), Some(dir)) = (info.total, plan.final_path.parent()) {
+                    download::check_disk_space(dir, total)?;
+                }
+                plan.ranges = match info.total {
+                    Some(total) if info.supports_ranges => {
+                        download::plan_segments(total, self.settings().segments)
+                    }
+                    _ => Vec::new(),
+                };
+                plan.total = info.total;
+                plan.supports_ranges = info.supports_ranges;
+                plan.validator = info.validator;
+            }
+            download::Engine::Ftp => {
+                plan.total = crate::ftp::remote_size(&plan.url, &session).await?;
+            }
+            download::Engine::YtDlp => {
+                delete_artifacts(&plan, false);
+                // `set_total` never shrinks, so the old size would stick.
+                plan.total = None;
+            }
+            download::Engine::Torrent => {
+                return Err("a torrent fetches the same content again; remove it and re-add it instead".into());
+            }
+        }
+
+        {
+            let mut queue = self.queue.lock().unwrap();
+            let d = queue
+                .iter_mut()
+                .find(|d| d.id == id && d.status == Status::Completed)
+                .ok_or_else(|| "that download changed while it was being checked".to_string())?;
+            d.done = vec![0; plan.segment_count()];
+            d.plan = plan;
+            d.status = Status::Queued;
+            d.error = None;
+        }
+        self.save_queue();
+        Ok(())
     }
 
     /// Drop an entry from the list. With `delete_file`, also erase the finished
@@ -1499,10 +1571,16 @@ fn delete_artifacts(plan: &download::DownloadPlan, partial_only: bool) {
         // `.part`. An unfinished one has files worth removing too, so
         // `partial_only` does not spare it.
         download::Engine::Torrent => {
-            if plan.final_path.is_dir() {
-                let _ = std::fs::remove_dir_all(&plan.final_path);
-            } else {
-                let _ = std::fs::remove_file(&plan.final_path);
+            // Guard against wiping the whole output directory if final_path
+            // was set to the parent folder or root.
+            if let Some(parent) = plan.final_path.parent() {
+                if plan.final_path != parent && plan.final_path.file_name().is_some() {
+                    if plan.final_path.is_dir() {
+                        let _ = std::fs::remove_dir_all(&plan.final_path);
+                    } else {
+                        let _ = std::fs::remove_file(&plan.final_path);
+                    }
+                }
             }
         }
         // FTP writes the same single `.part` the HTTP engine does, so it is
@@ -1517,8 +1595,9 @@ fn delete_artifacts(plan: &download::DownloadPlan, partial_only: bool) {
 }
 
 /// Remove every file in `path`'s directory whose name starts with `path`'s file
-/// stem — the set of yt-dlp intermediates for one download. Guarded so a short
-/// or placeholder stem can't sweep unrelated files.
+/// stem followed by a dot (`<stem>.<ext>`, `<stem>.fNNN.<ext>`, `<stem>.part`,
+/// `<stem>.ytdl`), or the file itself. Guarded so a short stem can't sweep
+/// unrelated files, and prefix matching never sweeps files sharing only a stem prefix.
 fn cleanup_by_stem(path: &std::path::Path) {
     let (Some(dir), Some(stem)) = (path.parent(), path.file_stem()) else {
         return;
@@ -1528,9 +1607,12 @@ fn cleanup_by_stem(path: &std::path::Path) {
         let _ = std::fs::remove_file(path);
         return;
     }
+    let prefix = format!("{stem}.");
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with(&*stem)
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if (name_str.starts_with(&prefix) || entry.path() == path)
                 && entry.path().is_file()
             {
                 let _ = std::fs::remove_file(entry.path());
@@ -1689,6 +1771,57 @@ mod tests {
         let path = state.queue.lock().unwrap()[0].plan.final_path.clone();
         assert_eq!(path.parent().unwrap(), dir.as_path());
         assert_eq!(path.file_name().unwrap(), "Real Title.mp4");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// yt-dlp would skip a file it finds already there, so a redownload must
+    /// clear it and reset the row; torrents and unfinished rows are refused.
+    #[tokio::test]
+    async fn redownload_resets_a_finished_video() {
+        let state = app();
+        let dir = scratch("redownload");
+        let mut plan = plan_in(&dir, "Clip [abc123].mp4");
+        plan.engine = crate::download::Engine::YtDlp;
+        std::fs::write(&plan.final_path, b"old").unwrap();
+        let mut done = Download::new("v".into(), plan.clone());
+        done.status = Status::Completed;
+        done.done = vec![1000];
+        let mut torrent = Download::new("t".into(), plan_in(&dir, "t"));
+        torrent.plan.engine = crate::download::Engine::Torrent;
+        torrent.status = Status::Completed;
+        let running = Download::new("r".into(), plan_in(&dir, "r"));
+        state.queue.lock().unwrap().extend([done, torrent, running]);
+
+        state.redownload("v").await.unwrap();
+        assert!(!plan.final_path.exists(), "old output would make yt-dlp skip");
+        {
+            let queue = state.queue.lock().unwrap();
+            let v = queue.iter().find(|d| d.id == "v").unwrap();
+            assert_eq!(v.status, Status::Queued);
+            assert_eq!(v.done, vec![0]);
+            assert_eq!(v.plan.total, None);
+        }
+        assert!(state.redownload("t").await.is_err());
+        assert!(state.redownload("r").await.is_err());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn display_name_rejects_traversal() {
+        let state = app();
+        let dir = scratch("display-traversal");
+        state.queue.lock().unwrap().push(Download::new("d1".into(), plan_in(&dir, "placeholder")));
+
+        state.set_display_name("d1", "../../evil.mp4");
+        let path = state.queue.lock().unwrap()[0].plan.final_path.clone();
+        assert_eq!(path.parent().unwrap(), dir.as_path());
+        assert_eq!(path.file_name().unwrap(), "evil.mp4");
+
+        state.set_display_name("d1", "../..");
+        let path = state.queue.lock().unwrap()[0].plan.final_path.clone();
+        assert_eq!(path.file_name().unwrap(), "evil.mp4");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -2087,11 +2220,14 @@ mod tests {
         }
         // An unrelated download in the same folder must survive.
         std::fs::write(dir.join("Someone Else.mp4"), b"x").unwrap();
+        // A file that shares the prefix but is not an intermediate must also survive.
+        std::fs::write(dir.join("Big Buck Bunny [abc123]_notes.txt"), b"x").unwrap();
         std::fs::create_dir(dir.join("Big Buck Bunny [abc123] subdir")).unwrap();
 
         delete_artifacts(&plan, true);
 
         assert!(dir.join("Someone Else.mp4").exists(), "swept an unrelated file");
+        assert!(dir.join("Big Buck Bunny [abc123]_notes.txt").exists(), "swept file sharing stem prefix");
         assert!(
             dir.join("Big Buck Bunny [abc123] subdir").exists(),
             "the sweep must not remove directories"
@@ -2100,9 +2236,25 @@ mod tests {
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with("Big Buck Bunny") && !n.ends_with("subdir"))
+            .filter(|n| n.starts_with("Big Buck Bunny [abc123]."))
             .collect();
         assert!(left.is_empty(), "intermediates left behind: {left:?}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn torrent_deletion_does_not_wipe_output_dir() {
+        let dir = scratch("torrent-safety");
+        let mut plan = plan_in(&dir, "safe_torrent_folder");
+        plan.engine = crate::download::Engine::Torrent;
+        std::fs::create_dir_all(&plan.final_path).unwrap();
+        std::fs::write(plan.final_path.join("file.iso"), b"data").unwrap();
+
+        // Normal torrent folder deletion removes the torrent subfolder:
+        delete_artifacts(&plan, false);
+        assert!(!plan.final_path.exists());
+        assert!(dir.exists(), "parent dir must survive");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

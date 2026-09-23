@@ -119,6 +119,8 @@ export const api = {
   resume: (id: string) => invoke<void>("resume_download", { id }),
   cancel: (id: string) => invoke<void>("cancel_download", { id }),
   retry: (id: string) => invoke<void>("retry_download", { id }),
+  /// Fetch a finished download again from scratch, overwriting the file.
+  redownload: (id: string) => invoke<void>("redownload", { id }),
   remove: (id: string, deleteFile: boolean) =>
     invoke<void>("remove_download", { id, deleteFile }),
   /// Reorder the queue: position is priority, so this is what moves a

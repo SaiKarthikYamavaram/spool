@@ -1162,6 +1162,12 @@ const Row = memo(function Row({
                 <Folder /> Open folder
               </DropdownMenuItem>
             )}
+            {/* A torrent would fetch identical bytes, so it gets no redownload. */}
+            {row.status === "completed" && row.engine !== "torrent" && (
+              <DropdownMenuItem onClick={() => api.redownload(row.id).catch(onFail)}>
+                <RotateCcw /> Redownload
+              </DropdownMenuItem>
+            )}
             <DropdownMenuItem
               onClick={() => {
                 navigator.clipboard

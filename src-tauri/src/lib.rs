@@ -184,6 +184,14 @@ fn retry_download(app: AppHandle, state: Shared<'_>, id: String) {
     state::pump(&app, &state);
 }
 
+/// Fetch a finished download again, replacing the file on disk.
+#[tauri::command]
+async fn redownload(app: AppHandle, state: Shared<'_>, id: String) -> Result<(), String> {
+    state.redownload(&id).await?;
+    state::pump(&app, &state);
+    Ok(())
+}
+
 /// Remove an entry. `delete_file` also erases the file from disk.
 #[tauri::command]
 fn remove_download(app: AppHandle, state: Shared<'_>, id: String, delete_file: bool) {
@@ -879,6 +887,7 @@ pub fn run() {
             resume_download,
             cancel_download,
             retry_download,
+            redownload,
             remove_download,
             rename_download,
             bulk_action,

@@ -97,6 +97,16 @@ async fn connect(raw: &str, session: &Session) -> Result<(AsyncFtpStream, String
     Ok((ftp, path))
 }
 
+/// Log in and ask for the file's length. `Ok(None)` when the server refuses
+/// `SIZE`, which is optional in the protocol and costs the progress bar and
+/// nothing else — the transfer still runs.
+pub async fn remote_size(url: &str, session: &Session) -> Result<Option<u64>, String> {
+    let (mut ftp, path) = connect(url, session).await?;
+    let total = ftp.size(&path).await.ok().map(|n| n as u64);
+    let _ = ftp.quit().await;
+    Ok(total)
+}
+
 /// Probe the server and reserve a local name, transferring nothing.
 pub async fn prepare(
     url: &str,
@@ -106,12 +116,7 @@ pub async fn prepare(
     custom_name: Option<&str>,
 ) -> Result<DownloadPlan, String> {
     let (_, _, _, remote_name) = parts(url)?;
-    let (mut ftp, path) = connect(url, session).await?;
-
-    // `SIZE` is optional in the protocol and refused by some servers, which
-    // costs the progress bar and nothing else — the transfer still runs.
-    let total = ftp.size(&path).await.ok().map(|n| n as u64);
-    let _ = ftp.quit().await;
+    let total = remote_size(url, session).await?;
 
     let filename = custom_name
         .and_then(sanitize_filename)

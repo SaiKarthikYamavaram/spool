@@ -50,6 +50,8 @@ purge_legacy() {
 
 uninstall() {
   rm -f "$BIN_DIR/$APP" "$APP_DIR/$APP.desktop" "$AUTOSTART"
+  # The app registers itself as the browser extension's native host at launch.
+  rm -f "${XDG_CONFIG_HOME:-$HOME/.config}"/{google-chrome,google-chrome-beta,google-chrome-unstable,chromium,BraveSoftware/Brave-Browser,microsoft-edge,vivaldi}/NativeMessagingHosts/com.saikarthik.spool.json
   find "$ICON_ROOT" \( -name "$APP.png" -o -name "$APP.svg" \) -delete 2>/dev/null || true
   purge_legacy
   command -v update-desktop-database >/dev/null && update-desktop-database "$APP_DIR" 2>/dev/null || true

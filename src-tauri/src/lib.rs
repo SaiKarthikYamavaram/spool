@@ -620,6 +620,13 @@ async fn update_settings(app: AppHandle, state: Shared<'_>, settings: Settings) 
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The browser starts this binary as the extension's native host; relay and
+    // exit before any of the app (or its single-instance check) starts.
+    #[cfg(unix)]
+    if server::launched_as_host() {
+        return server::run_host();
+    }
+
     tauri::Builder::default()
         // Must be registered first: a second launch is intercepted here and
         // focuses the running window instead of starting another process.
@@ -751,7 +758,8 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // Localhost bridge the browser extension POSTs captured sessions to.
+            // Bridge the browser extension hands captured sessions to.
+            server::register_host();
             server::start(handle.clone(), Arc::clone(&state));
 
             // One flusher for the whole queue: active downloads only mark it

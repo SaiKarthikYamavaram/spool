@@ -1,12 +1,14 @@
 {
   "manifest_version": 3,
   "name": "spool integration",
-  "version": "1.4.1",
+  "version": "1.5.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsPs61fOVRHgcRosAUe5TIwbWUr4oKOLdRL2bymIJaX0MkSL/Gk3Nh6U08pG/ParF3ZLKiKkacd4D9udwiEXfxi+6qxGQXO2Mj3NzTdbpok/hGLaV/IuZSV+BolS6VPbbqFNMZ3PDMoZdQ+UYW5/god87FPSpXHPnjOMfXL1XtwViIcOxvo7a5OSbNynJ7qeSqKL3//V5kCMZw2V3GdzPeBUhTh84gGpx6hZtAauI22uRY2UJNTxm4ZUoMUm3hB9IirxVLs0SCpG/VYwHv4sCqIn3zZLGJ9mboGvG1Bqq4aW2ZKFZzkKOi659IpUCKj5bg8gng3XMKwjJ4vkRMOVDbQIDAQAB",
   "description": "Send downloads to spool with the browser's cookies. Detects media on a page, grabs all links or images, and routes captured downloads by file type.",
   "permissions": [
     "cookies",
     "contextMenus",
     "downloads",
+    "nativeMessaging",
     "notifications",
     "storage",
     "webRequest",
@@ -14,7 +16,6 @@
     "tabs"
   ],
   "host_permissions": [
-    "http://127.0.0.1:47831/",
     "<all_urls>"
   ],
   "background": {

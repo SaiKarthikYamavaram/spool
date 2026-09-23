@@ -1,36 +1,55 @@
-//! Localhost bridge for the browser extension.
+//! Native-messaging bridge for the browser extension.
 //!
 //! This is the mechanism a real download manager uses to get past an
 //! interactive anti-bot challenge: it does not solve the challenge, the
 //! browser does. The extension watches for a download, reads the cookies the
 //! browser already holds for that site (including whatever `cf_clearance` it
-//! earned), and POSTs the URL plus that session here. spool then replays a
+//! earned), and sends the URL plus that session here. spool then replays a
 //! session the browser established.
 //!
-//! `tiny_http` on a dedicated thread rather than the Tokio runtime: the server
-//! is a slow, low-volume control channel (a click at a time), so a blocking
-//! listener is simpler than wiring another async stack, and it stays entirely
-//! out of the way of the download tasks.
+//! The extension cannot open a socket. It asks the browser to launch a
+//! registered "native host" and talks to it over stdin/stdout. The host is this
+//! same binary, started with the extension's origin as its first argument
+//! (`run_host`): it connects to a Unix socket the running app listens on and
+//! relays bytes both ways, so the app speaks the native-messaging framing — a
+//! native-endian `u32` length, then that many bytes of JSON — directly.
+//!
+//! Only the extension named in the host manifest's `allowed_origins` can have
+//! the browser launch the host, and the app answers only connections from its
+//! own user, so neither a web page nor another account can reach it — which
+//! the localhost HTTP port this replaced could not promise.
 
-use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Deserialize;
+use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
-use tiny_http::{Header, Method, Response, Server};
 
 use crate::download::Session;
 use crate::state::{self, AppState, ConfirmRequest, PendingAdd};
 
-/// Fixed port so the extension has a constant target. Bound to loopback only.
-pub const PORT: u16 = 47831;
+/// The name the extension passes to `chrome.runtime.sendNativeMessage`.
+pub const HOST_NAME: &str = "com.saikarthik.spool";
 
-/// Threads serving `/add`. Each can block for seconds on a metadata probe, so
-/// a few give batch grabs some parallelism without unbounded spawning.
-const ADD_WORKERS: usize = 4;
+/// Pinned by the `key` in `extension/manifest.json`, so an unpacked load gets
+/// the same ID on every machine and the host manifest can name it.
+pub const EXTENSION_ID: &str = "mlddhjdhcladccjcgffcmeonbjhkhhlo";
 
-/// The JSON the extension sends.
+/// A captured session is a URL and a cookie header; anything near this size is
+/// not one.
+const MAX_MESSAGE: usize = 64 * 1024;
+
+/// What the extension sends.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum Message {
+    /// Health check so the extension can tell whether spool is up.
+    Ping,
+    Add(AddRequest),
+}
+
+/// A download handed over by the extension.
 #[derive(Debug, Deserialize)]
 struct AddRequest {
     url: String,
@@ -47,160 +66,257 @@ struct AddRequest {
     ask: bool,
 }
 
-/// Start the bridge on its own thread. Returns immediately; logs and keeps
-/// running for the life of the process. A bind failure is not fatal — the app
-/// still works without the extension — so it is logged, not propagated.
-pub fn start(app: AppHandle, state: Arc<AppState>) {
+/// Where the app listens and the host connects. The runtime dir is private to
+/// the user; `~/.cache` is the fallback where there is none. Never the shared
+/// temp dir: another account could bind the path first and collect cookies.
+fn socket_path() -> Option<PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .map(|dir| dir.join("spool.sock"))
+}
+
+/// Whether the browser launched this process as the native host. Chrome passes
+/// the calling extension's origin as the first argument.
+pub fn launched_as_host() -> bool {
+    std::env::args().nth(1).is_some_and(|a| a.starts_with("chrome-extension://"))
+}
+
+/// Relay the browser's stdin/stdout to the running app until either side
+/// closes. Exits without a reply when the app is not running, which the
+/// extension reads as "not reachable" and leaves the download to the browser.
+#[cfg(unix)]
+pub fn run_host() {
+    use std::os::unix::net::UnixStream;
+
+    let Some(Ok(socket)) = socket_path().map(UnixStream::connect) else {
+        eprintln!("spool: the app is not running");
+        std::process::exit(1);
+    };
+    let Ok(up) = socket.try_clone() else { std::process::exit(1) };
     std::thread::spawn(move || {
-        let addr = (Ipv4Addr::LOCALHOST, PORT);
-        let server = match Server::http(addr) {
-            Ok(s) => s,
+        relay(std::io::stdin().lock(), &up);
+        // Tell the app no more requests are coming, so it closes its end and
+        // the reply direction below finishes.
+        let _ = up.shutdown(std::net::Shutdown::Write);
+    });
+    relay(&socket, std::io::stdout().lock());
+}
+
+/// Copy until EOF, flushing each chunk. `io::copy` into stdout would sit on a
+/// reply that has no trailing newline until the process exits, and the
+/// browser waits for that reply before it closes stdin — a deadlock.
+fn relay(mut from: impl std::io::Read, mut to: impl std::io::Write) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match from.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                if to.write_all(&buf[..n]).and_then(|_| to.flush()).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Tell each installed Chromium-family browser where the host is. Rewritten on
+/// every launch, like the autostart entry, so a moved or reinstalled binary is
+/// picked up without a reinstall step. Not fatal: the app works without the
+/// extension.
+#[cfg(target_os = "linux")]
+pub fn register_host() {
+    const BROWSERS: &[&str] = &[
+        "google-chrome",
+        "google-chrome-beta",
+        "google-chrome-unstable",
+        "chromium",
+        "BraveSoftware/Brave-Browser",
+        "microsoft-edge",
+        "vivaldi",
+    ];
+
+    let Some(config) = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    else {
+        return;
+    };
+    // An AppImage runs from a mount point that changes every launch; the
+    // browser has to be pointed at the AppImage file itself.
+    let Some(exe) = std::env::var_os("APPIMAGE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok())
+    else {
+        return;
+    };
+    let manifest = host_manifest(&exe);
+
+    for browser in BROWSERS {
+        let profile = config.join(browser);
+        if !profile.is_dir() {
+            continue; // not installed
+        }
+        let hosts = profile.join("NativeMessagingHosts");
+        let written = std::fs::create_dir_all(&hosts)
+            .and_then(|_| std::fs::write(hosts.join(format!("{HOST_NAME}.json")), &manifest));
+        if let Err(e) = written {
+            eprintln!("spool: could not register the extension host for {browser}: {e}");
+        }
+    }
+}
+
+// ponytail: Linux only; macOS wants ~/Library/Application Support/<browser>/
+// NativeMessagingHosts and Windows a registry key, add them if spool ships there.
+#[cfg(not(target_os = "linux"))]
+pub fn register_host() {}
+
+fn host_manifest(exe: &std::path::Path) -> String {
+    serde_json::to_string_pretty(&json!({
+        "name": HOST_NAME,
+        "description": "spool download manager",
+        "path": exe,
+        "type": "stdio",
+        "allowed_origins": [format!("chrome-extension://{EXTENSION_ID}/")],
+    }))
+    .unwrap()
+}
+
+/// Listen for host connections for the life of the app. A bind failure is not
+/// fatal — the app still works without the extension — so it is logged, not
+/// propagated.
+#[cfg(unix)]
+pub fn start(app: AppHandle, state: Arc<AppState>) {
+    use tokio::net::UnixListener;
+
+    let Some(path) = socket_path() else {
+        eprintln!("spool: extension bridge disabled, no runtime or home directory");
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        // The single-instance plugin has already turned away a second launch,
+        // so a socket file here is a crashed run's leftover.
+        let _ = std::fs::remove_file(&path);
+        let listener = match UnixListener::bind(&path) {
+            Ok(l) => l,
             Err(e) => {
-                eprintln!("spool: extension bridge disabled, cannot bind 127.0.0.1:{PORT}: {e}");
+                eprintln!("spool: extension bridge disabled, cannot bind {}: {e}", path.display());
                 return;
             }
         };
-        eprintln!("spool: extension bridge listening on 127.0.0.1:{PORT}");
-
-        // A bounded pool rather than a thread per request: "download all links"
-        // fires one POST per link, and any local process can hit this endpoint,
-        // so unbounded spawning would be a cheap way to exhaust threads.
-        let (work_tx, work_rx) =
-            std::sync::mpsc::channel::<(tiny_http::Request, String, Option<String>)>();
-        let work_rx = Arc::new(std::sync::Mutex::new(work_rx));
-        for _ in 0..ADD_WORKERS {
-            let rx = Arc::clone(&work_rx);
-            let app = app.clone();
-            let state = Arc::clone(&state);
-            std::thread::spawn(move || loop {
-                let job = { rx.lock().unwrap().recv() };
-                let Ok((request, body, origin)) = job else { return };
-                let response = match handle_add(&app, &state, &body) {
-                    Ok(id) => cors(Response::from_string(id), origin.as_deref()),
-                    Err(e) => cors(Response::from_string(e).with_status_code(400), origin.as_deref()),
-                };
-                let _ = request.respond(response);
-            });
-        }
-
-        for mut request in server.incoming_requests() {
-            // Defence in depth: tiny_http is bound to loopback already, but a
-            // request that somehow arrives from off-box is refused rather than
-            // trusted.
-            if !is_loopback(&request) {
-                let _ = request.respond(Response::empty(403));
+        // SAFETY: `getuid` has no preconditions and cannot fail.
+        let me = unsafe { libc::getuid() };
+        loop {
+            let stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    // Out of file descriptors, most likely; back off rather
+                    // than spin on the same error.
+                    eprintln!("spool: extension bridge accept failed: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    continue;
+                }
+            };
+            // The socket may sit in a directory other users can enter.
+            if !stream.peer_cred().is_ok_and(|c| c.uid() == me) {
                 continue;
             }
-
-            // Protect against localhost drive-by CSRF / SSRF: reject requests
-            // originating from ordinary web pages (http://, https://, null).
-            // Only browser extension origins or local non-browser tools (no
-            // Origin header, e.g. curl) are permitted.
-            let origin = get_origin(&request);
-            if !is_allowed_origin(origin.as_deref()) {
-                let _ = request.respond(Response::empty(403));
-                continue;
-            }
-
-            match (request.method(), request.url()) {
-                // Preflight for the extension's cross-origin POST.
-                (Method::Options, _) => {
-                    let _ = request.respond(cors(Response::empty(204), origin.as_deref()));
-                }
-                // Health check so the extension can tell whether spool is up.
-                (Method::Get, "/ping") => {
-                    let _ = request.respond(cors(Response::from_string("spool"), origin.as_deref()));
-                }
-                (Method::Post, "/add") => {
-                    const MAX_BODY: usize = 64 * 1024;
-                    let body = match read_body(request.as_reader(), MAX_BODY) {
-                        Ok(b) => b,
-                        Err(BodyError::TooLarge) => {
-                            let _ = request.respond(cors(
-                                Response::from_string("payload too large").with_status_code(413),
-                                origin.as_deref(),
-                            ));
-                            continue;
-                        }
-                        Err(BodyError::BadBody) => {
-                            let _ = request.respond(cors(
-                                Response::from_string("bad body").with_status_code(400),
-                                origin.as_deref(),
-                            ));
-                            continue;
-                        }
-                    };
-                    // Hand to the worker pool: a video /add blocks on a ~15s
-                    // yt-dlp metadata probe, and the accept loop must stay free
-                    // to answer /ping meanwhile.
-                    if work_tx.send((request, body, origin)).is_err() {
-                        break; // workers gone; nothing left to serve
-                    }
-                }
-                _ => {
-                    let _ = request.respond(cors(Response::empty(404), origin.as_deref()));
-                }
-            }
+            // A task per connection: a video add waits ~15s on a yt-dlp probe,
+            // and the popup's ping must not queue behind it.
+            tauri::async_runtime::spawn(serve(app.clone(), Arc::clone(&state), stream));
         }
     });
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum BodyError {
-    TooLarge,
-    BadBody,
+// ponytail: Unix only; a Windows build needs a named pipe here and a registry
+// entry in `register_host`.
+#[cfg(not(unix))]
+pub fn start(_app: AppHandle, _state: Arc<AppState>) {
+    eprintln!("spool: extension bridge is only built for Unix");
 }
 
-/// Read request body up to `max_bytes`. If the incoming stream exceeds
-/// `max_bytes`, returns `TooLarge` even if the cutoff falls in the middle
-/// of a multi-byte UTF-8 character.
-fn read_body<R: Read>(reader: R, max_bytes: usize) -> Result<String, BodyError> {
-    let mut buf = Vec::new();
-    let mut limited = reader.take((max_bytes + 1) as u64);
-    if limited.read_to_end(&mut buf).is_err() {
-        return Err(BodyError::BadBody);
+/// Answer requests on one connection until the host hangs up.
+async fn serve<S>(app: AppHandle, state: Arc<AppState>, mut stream: S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    // An oversized or truncated frame ends the connection; the extension sees
+    // the host exit and reports the handover as failed.
+    while let Ok(Some(body)) = read_frame(&mut stream).await {
+        let reply = match parse_message(&body) {
+            Ok(Message::Ping) => json!({ "ok": true }),
+            Ok(Message::Add(req)) => match handle_add(&app, &state, req).await {
+                Ok(id) => json!({ "ok": true, "id": id }),
+                Err(e) => json!({ "ok": false, "error": e }),
+            },
+            Err(e) => json!({ "ok": false, "error": e }),
+        };
+        if write_frame(&mut stream, &reply).await.is_err() {
+            return;
+        }
     }
-    if buf.len() > max_bytes {
-        return Err(BodyError::TooLarge);
-    }
-    String::from_utf8(buf).map_err(|_| BodyError::BadBody)
 }
 
-fn parse_add_payload(body: &str) -> Result<AddRequest, String> {
-    let req: AddRequest =
-        serde_json::from_str(body).map_err(|e| format!("invalid request JSON: {e}"))?;
+/// One native-messaging frame, or `None` at a clean end of stream.
+async fn read_frame<R>(r: &mut R) -> std::io::Result<Option<Vec<u8>>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
 
-    if req.url.trim().is_empty() {
-        return Err("empty URL".to_string());
+    let mut len = [0u8; 4];
+    match r.read_exact(&mut len).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
     }
-
-    Ok(req)
+    let len = u32::from_ne_bytes(len) as usize;
+    if len > MAX_MESSAGE {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "message too large"));
+    }
+    let mut body = vec![0; len];
+    r.read_exact(&mut body).await?;
+    Ok(Some(body))
 }
 
-fn handle_add(app: &AppHandle, state: &Arc<AppState>, body: &str) -> Result<String, String> {
-    let req = parse_add_payload(body)?;
+async fn write_frame<W>(w: &mut W, value: &Value) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let body = serde_json::to_vec(value)?;
+    w.write_all(&(body.len() as u32).to_ne_bytes()).await?;
+    w.write_all(&body).await?;
+    w.flush().await
+}
+
+fn parse_message(body: &[u8]) -> Result<Message, String> {
+    let msg: Message =
+        serde_json::from_slice(body).map_err(|e| format!("invalid request JSON: {e}"))?;
+    if let Message::Add(req) = &msg {
+        if req.url.trim().is_empty() {
+            return Err("empty URL".to_string());
+        }
+    }
+    Ok(msg)
+}
+
+async fn handle_add(app: &AppHandle, state: &Arc<AppState>, req: AddRequest) -> Result<String, String> {
     let session = session_from(&req);
-
-    // Hand off to the same async path the UI uses. The bridge thread is
-    // blocking, so bounce onto the Tokio runtime and wait for the result to
-    // report a real error back to the extension.
-    let app = app.clone();
-    let state = Arc::clone(state);
-    let url = req.url.clone();
-
-    let force_video = req.video;
+    let AddRequest { url, video: force_video, ask, .. } = req;
 
     // "Ask before download": park the captured session and let the UI collect
     // the destination and options. Returns immediately — no metadata probe,
     // no queue entry until the user confirms.
-    if req.ask {
+    if ask {
         let token = state.stash_pending(PendingAdd {
             url: url.clone(),
             session: Some(session),
             force_video,
             added_at: crate::queue::now_secs(),
         });
-        crate::show_main(&app);
+        crate::show_main(app);
         let _ = app.emit(
             "download://confirm",
             ConfirmRequest { token: token.clone(), url, video: force_video },
@@ -208,16 +324,9 @@ fn handle_add(app: &AppHandle, state: &Arc<AppState>, body: &str) -> Result<Stri
         return Ok(token);
     }
 
-    let (tx, rx) = std::sync::mpsc::channel();
-    tauri::async_runtime::spawn(async move {
-        let result = state.add_with_session(&app, &url, Some(session), force_video, Default::default()).await;
-        if result.is_ok() {
-            state::pump(&app, &state);
-        }
-        let _ = tx.send(result);
-    });
-
-    rx.recv().map_err(|_| "internal error".to_string())?
+    let id = state.add_with_session(app, &url, Some(session), force_video, Default::default()).await?;
+    state::pump(app, state);
+    Ok(id)
 }
 
 /// Turn the extension's payload into a replayable session.
@@ -242,64 +351,6 @@ fn session_from(req: &AddRequest) -> Session {
     }
 }
 
-fn get_origin(request: &tiny_http::Request) -> Option<String> {
-    request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Origin"))
-        .map(|h| h.value.as_str().to_string())
-}
-
-/// Only allow requests from browser extensions (chrome-extension://, moz-extension://)
-/// or local non-browser tools (no Origin header, e.g. curl/scripts on loopback).
-/// Web pages (http://, https://, null) are rejected to prevent drive-by CSRF / SSRF.
-fn is_allowed_origin(origin: Option<&str>) -> bool {
-    match origin {
-        None => true,
-        Some(o) => {
-            let o = o.trim();
-            o.starts_with("chrome-extension://") || o.starts_with("moz-extension://")
-        }
-    }
-}
-
-fn is_loopback(request: &tiny_http::Request) -> bool {
-    match request.remote_addr() {
-        Some(addr) => match addr.ip() {
-            IpAddr::V4(ip) => ip.is_loopback(),
-            IpAddr::V6(ip) => ip.is_loopback(),
-        },
-        // Unix socket or unknown transport: not a remote TCP peer, treat as local.
-        None => true,
-    }
-}
-
-/// The extension's service worker makes a cross-origin request, so reply
-/// with CORS for verified extension origins. Never send wildcard "*" so
-/// websites cannot reach this endpoint.
-fn cors<R>(response: Response<R>, origin: Option<&str>) -> Response<R>
-where
-    R: Read,
-{
-    let allow_headers =
-        Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type"[..]).unwrap();
-    let allow_methods =
-        Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"POST, GET, OPTIONS"[..]).unwrap();
-    let mut resp = response.with_header(allow_headers).with_header(allow_methods);
-
-    if let Some(o) = origin {
-        let o = o.trim();
-        if o.starts_with("chrome-extension://") || o.starts_with("moz-extension://") {
-            if let Ok(allow_origin) =
-                Header::from_bytes(&b"Access-Control-Allow-Origin"[..], o.as_bytes())
-            {
-                resp.add_header(allow_origin);
-            }
-        }
-    }
-    resp
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,7 +360,7 @@ mod tests {
     }
 
     /// The extension's minimal payload: a URL and nothing else. Every other
-    /// field has to default, or a plain right-click would be a 400.
+    /// field has to default, or a plain right-click would be refused.
     #[test]
     fn minimal_payload_defaults_everything() {
         let req = parse(r#"{"url":"https://example.com/a.zip"}"#);
@@ -357,43 +408,63 @@ mod tests {
     }
 
     #[test]
+    fn messages_are_told_apart_by_type() {
+        assert!(matches!(parse_message(br#"{"type":"ping"}"#), Ok(Message::Ping)));
+        let Ok(Message::Add(req)) = parse_message(br#"{"type":"add","url":"https://e.test/a"}"#) else {
+            panic!("an add must parse");
+        };
+        assert_eq!(req.url, "https://e.test/a");
+        assert!(parse_message(br#"{"type":"delete","url":"x"}"#).is_err());
+        assert!(parse_message(br#"{"url":"https://e.test/a"}"#).is_err(), "a message needs a type");
+    }
+
+    #[test]
     fn blank_url_is_rejected() {
-        let err = parse_add_payload(r#"{"url":"   "}"#).unwrap_err();
+        let err = parse_message(br#"{"type":"add","url":"   "}"#).unwrap_err();
         assert_eq!(err, "empty URL");
-
-        let err_empty = parse_add_payload(r#"{"url":""}"#).unwrap_err();
-        assert_eq!(err_empty, "empty URL");
+        let err = parse_message(br#"{"type":"add","url":""}"#).unwrap_err();
+        assert_eq!(err, "empty URL");
     }
 
-    #[test]
-    fn read_body_accepts_under_limit() {
-        let data = "hello world".as_bytes();
-        let res = read_body(data, 64).unwrap();
-        assert_eq!(res, "hello world");
+    #[tokio::test]
+    async fn frames_round_trip() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        write_frame(&mut a, &json!({ "ok": true })).await.unwrap();
+        drop(a);
+        let body = read_frame(&mut b).await.unwrap().unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), json!({ "ok": true }));
+        // The writer hung up between frames: a clean end, not an error.
+        assert!(read_frame(&mut b).await.unwrap().is_none());
     }
 
-    #[test]
-    fn read_body_rejects_payload_too_large() {
-        let data = vec![b'a'; 100];
-        let err = read_body(&data[..], 50).unwrap_err();
-        assert_eq!(err, BodyError::TooLarge);
+    #[tokio::test]
+    async fn an_oversized_frame_is_refused_before_reading_it() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        use tokio::io::AsyncWriteExt;
+        a.write_all(&((MAX_MESSAGE + 1) as u32).to_ne_bytes()).await.unwrap();
+        let err = read_frame(&mut b).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
-    /// When a payload over the limit is cut off in the middle of a multi-byte
-    /// UTF-8 sequence, it must report TooLarge (413), not BadBody (400).
-    #[test]
-    fn read_body_returns_too_large_even_if_cutoff_splits_utf8() {
-        let mut data = vec![b'a'; 10];
-        data.extend_from_slice("🦀".as_bytes()); // 4-byte character
-        let err = read_body(&data[..], 11).unwrap_err();
-        assert_eq!(err, BodyError::TooLarge);
+    #[tokio::test]
+    async fn a_truncated_frame_is_an_error() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        use tokio::io::AsyncWriteExt;
+        a.write_all(&10u32.to_ne_bytes()).await.unwrap();
+        a.write_all(b"{}").await.unwrap();
+        drop(a);
+        assert!(read_frame(&mut b).await.is_err());
     }
 
+    /// The browser refuses a host manifest whose origin lacks the trailing
+    /// slash, and only launches the host for the origins listed.
     #[test]
-    fn read_body_rejects_invalid_utf8_under_limit() {
-        let data = [0xFF, 0xFE, 0xFD];
-        let err = read_body(&data[..], 10).unwrap_err();
-        assert_eq!(err, BodyError::BadBody);
+    fn host_manifest_allows_only_the_extension() {
+        let m: Value = serde_json::from_str(&host_manifest(std::path::Path::new("/opt/spool"))).unwrap();
+        assert_eq!(m["name"], HOST_NAME);
+        assert_eq!(m["path"], "/opt/spool");
+        assert_eq!(m["type"], "stdio");
+        assert_eq!(m["allowed_origins"], json!([format!("chrome-extension://{EXTENSION_ID}/")]));
     }
 
     /// The extension sends "" for a header it could not read. An empty
@@ -424,48 +495,5 @@ mod tests {
             r#"{"url":"https://e.test/a","userAgent":"CustomAgent/1.0"}"#,
         ));
         assert_eq!(session.user_agent, "CustomAgent/1.0");
-    }
-
-    #[test]
-    fn origin_filtering_blocks_web_origins_and_allows_extensions() {
-        // Extensions allowed
-        assert!(is_allowed_origin(Some("chrome-extension://abcdefghijklmnop")));
-        assert!(is_allowed_origin(Some("moz-extension://1234-5678-90ab")));
-
-        // Local non-browser CLI allowed
-        assert!(is_allowed_origin(None));
-
-        // Websites and opaque origins rejected
-        assert!(!is_allowed_origin(Some("https://attacker.com")));
-        assert!(!is_allowed_origin(Some("http://evil.com:8080")));
-        assert!(!is_allowed_origin(Some("http://localhost:3000")));
-        assert!(!is_allowed_origin(Some("null")));
-    }
-
-    #[test]
-    fn cors_headers_reflect_extension_origin_only() {
-        let resp = cors(Response::empty(200), Some("chrome-extension://my-ext-id"));
-        let headers = resp.headers();
-        let allow_origin = headers
-            .iter()
-            .find(|h| h.field.equiv("Access-Control-Allow-Origin"));
-        assert_eq!(
-            allow_origin.map(|h| h.value.as_str()),
-            Some("chrome-extension://my-ext-id")
-        );
-
-        let resp_none = cors(Response::empty(200), None);
-        let allow_origin_none = resp_none
-            .headers()
-            .iter()
-            .find(|h| h.field.equiv("Access-Control-Allow-Origin"));
-        assert!(allow_origin_none.is_none());
-
-        let resp_web = cors(Response::empty(200), Some("https://evil.com"));
-        let allow_origin_web = resp_web
-            .headers()
-            .iter()
-            .find(|h| h.field.equiv("Access-Control-Allow-Origin"));
-        assert!(allow_origin_web.is_none());
     }
 }

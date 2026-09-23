@@ -6,7 +6,8 @@ User-Agent and Referer — so authenticated and anti-bot-challenged files
 
 ## Install (Chromium / Chrome / Brave / Edge)
 
-1. Start the spool app (it listens on `127.0.0.1:47831`).
+1. Start the spool app once. It registers itself as this extension's
+   native-messaging host with each installed Chromium-family browser.
 2. Open `chrome://extensions`, enable **Developer mode**.
 3. **Load unpacked** → select this `extension/` folder.
 4. The toolbar icon shows a green dot when the app is reachable.

@@ -1,7 +1,8 @@
 // Shared helpers for background, popup and options. Loaded via importScripts in
 // the service worker and a plain <script> in the pages.
 
-const SPOOL = "http://127.0.0.1:47831";
+// The native host the app registers with each browser (see server.rs).
+const HOST = "com.saikarthik.spool";
 
 // Cookies bind to the exact User-Agent that earned them, so always send the
 // browser's real one.
@@ -153,21 +154,23 @@ async function cookieHeaderFor(url) {
 async function sendToSpool(url, referer, video = false, ask = null) {
   const cookie = await cookieHeaderFor(url);
   const askBeforeDownload = ask === null ? (await getSettings()).askBeforeDownload : ask;
-  try {
-    const res = await fetch(`${SPOOL}/add`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, cookie, userAgent: UA, referer, video, ask: askBeforeDownload }),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+  const reply = await callSpool({
+    type: "add", url, cookie, userAgent: UA, referer, video, ask: askBeforeDownload,
+  });
+  return reply.ok === true;
 }
 
 async function spoolAlive() {
+  return (await callSpool({ type: "ping" })).ok === true;
+}
+
+// One request to the app through its native host. The browser rejects when the
+// host is not registered or exits without answering (the app is not running),
+// so every failure comes back as an empty reply rather than a throw.
+async function callSpool(message) {
   try {
-    const res = await fetch(`${SPOOL}/ping`);
-    return res.ok;
-  } catch { return false; }
+    return (await chrome.runtime.sendNativeMessage(HOST, message)) || {};
+  } catch {
+    return {};
+  }
 }

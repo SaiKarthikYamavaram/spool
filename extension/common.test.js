@@ -12,18 +12,20 @@ const SOURCE = readFileSync(join(HERE, "common.js"), "utf8");
 /// `<script>`. Evaluate the real shipped file in a sandbox with the browser
 /// APIs stubbed, so these tests exercise what actually ships rather than a
 /// copy.
-function load(overrides = {}) {
+/// `native` stands in for `chrome.runtime.sendNativeMessage`, kept apart from
+/// `chrome` so a test can swap the storage or cookies stubs without it.
+function load({ native = async () => ({ ok: true }), ...overrides } = {}) {
   const sandbox = {
     navigator: { userAgent: "TestAgent/1.0" },
     chrome: {
       storage: { local: { get: async () => ({}), set: async () => {} } },
       cookies: { getAll: async () => [] },
     },
-    fetch: async () => ({ ok: true }),
     console,
     URL,
     ...overrides,
   };
+  sandbox.chrome = { ...sandbox.chrome, runtime: { sendNativeMessage: native } };
   vm.createContext(sandbox);
   vm.runInContext(SOURCE, sandbox);
   return sandbox;
@@ -282,9 +284,9 @@ describe("sendToSpool", () => {
   function harness(overrides = {}) {
     const calls = [];
     const e = load({
-      fetch: vi.fn(async (url, init) => {
-        calls.push({ url, body: init && JSON.parse(init.body) });
-        return { ok: true };
+      native: vi.fn(async (host, body) => {
+        calls.push({ host, body });
+        return { ok: true, id: "d1" };
       }),
       chrome: {
         storage: { local: { get: async () => ({}), set: async () => {} } },
@@ -298,7 +300,8 @@ describe("sendToSpool", () => {
   it("posts the URL with the browser's cookies and agent", async () => {
     const { e, calls } = harness();
     await expect(e.sendToSpool("https://e.test/a.zip", "https://e.test/")).resolves.toBe(true);
-    expect(calls[0].url).toBe("http://127.0.0.1:47831/add");
+    expect(calls[0].host).toBe("com.saikarthik.spool");
+    expect(calls[0].body.type).toBe("add");
     expect(calls[0].body.cookie).toBe("a=1; b=2");
     expect(calls[0].body.userAgent).toBe("TestAgent/1.0");
     expect(calls[0].body.referer).toBe("https://e.test/");
@@ -337,15 +340,15 @@ describe("sendToSpool", () => {
 
   it("reports failure instead of throwing when spool is not running", async () => {
     const { e } = harness({
-      fetch: async () => {
-        throw new TypeError("Failed to fetch");
+      native: async () => {
+        throw new Error("Native host has exited.");
       },
     });
     await expect(e.sendToSpool("https://e.test/a.zip", null)).resolves.toBe(false);
   });
 
-  it("reports failure on a non-OK reply", async () => {
-    const { e } = harness({ fetch: async () => ({ ok: false }) });
+  it("reports failure when the app refuses the download", async () => {
+    const { e } = harness({ native: async () => ({ ok: false, error: "empty URL" }) });
     await expect(e.sendToSpool("https://e.test/a.zip", null)).resolves.toBe(false);
   });
 
@@ -369,17 +372,19 @@ describe("sendToSpool", () => {
 
 describe("spoolAlive", () => {
   it("is true only when the ping answers", async () => {
-    const up = load({ fetch: async () => ({ ok: true }) });
+    const up = load({ native: async (_host, msg) => (msg.type === "ping" ? { ok: true } : {}) });
     await expect(up.spoolAlive()).resolves.toBe(true);
 
+    // Host not registered, or registered but the app is not running.
     const refusing = load({
-      fetch: async () => {
-        throw new TypeError("Failed to fetch");
+      native: async () => {
+        throw new Error("Specified native messaging host not found.");
       },
     });
     await expect(refusing.spoolAlive()).resolves.toBe(false);
 
-    const erroring = load({ fetch: async () => ({ ok: false }) });
-    await expect(erroring.spoolAlive()).resolves.toBe(false);
+    // A host that answers nothing at all.
+    const silent = load({ native: async () => undefined });
+    await expect(silent.spoolAlive()).resolves.toBe(false);
   });
 });

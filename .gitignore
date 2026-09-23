@@ -25,3 +25,4 @@ dist-ssr
 
 # graphify knowledge-graph output (generated, not source)
 graphify-out/
+extension-key.pem

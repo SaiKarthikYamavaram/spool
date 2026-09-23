@@ -283,7 +283,7 @@ chrome.downloads.onCreated.addListener((item) => {
 /// Cancel first, ask questions after.
 ///
 /// The old order checked that spool was reachable before cancelling, which
-/// meant a round trip to 127.0.0.1 while the browser was already prompting for
+/// meant a round trip to the app while the browser was already prompting for
 /// a location and pulling bytes — so the download happened twice. Cancelling
 /// is the first thing now, and the restore path below is what makes that safe:
 /// if the handover fails for any reason, the browser gets the download back.

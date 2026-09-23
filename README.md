@@ -87,9 +87,14 @@ Not on any store — load it unpacked:
 2. Turn on **Developer mode**
 3. **Load unpacked** → select the `extension/` directory
 
-It talks to the app over `http://127.0.0.1:47831`, loopback only. The app has
-to be running for the extension to hand anything over; if it is not, the
-extension leaves the download to the browser rather than losing it.
+It talks to the app through native messaging: the browser launches spool as
+the extension's "native host", which relays to the running app over a socket in
+`$XDG_RUNTIME_DIR`. The app registers that host with Chrome, Chromium, Brave,
+Edge and Vivaldi each time it starts, and only this extension's ID may use it,
+so web pages cannot reach the app. The app has to be running for the extension
+to hand anything over; if it is not, the extension leaves the download to the
+browser rather than losing it. Launch the app once before loading the
+extension so the host is registered.
 
 ---
 
@@ -139,7 +144,7 @@ src-tauri/src/
   download.rs         the segmented HTTP engine
   ytdlp.rs            the video engine, and what routes to it
   state.rs            queue, settings, and the pump that starts transfers
-  server.rs           the localhost bridge the extension posts to
+  server.rs           the native-messaging bridge the extension talks to
   thumbs.rs           poster frames
   cookies.rs          Netscape cookies.txt
 extension/            the MV3 browser extension

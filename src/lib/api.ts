@@ -69,6 +69,13 @@ export type ProgressRow = {
   total: number | null;
 };
 
+export type ExtensionStatus = {
+  connected: boolean;
+  last_seen_secs_ago: number | null;
+  canonical_path: string;
+  registered_browsers: string[];
+};
+
 /// Per-download choices from the add dialog; omitted fields use the settings.
 export type AddOptions = {
   dir?: string | null;
@@ -87,6 +94,11 @@ export const api = {
   addPending: (token: string, options?: AddOptions) =>
     invoke<string>("add_pending", { token, options: options ?? null }),
   cancelPending: (token: string) => invoke<void>("cancel_pending", { token }),
+  /// Browser extension status and setup helpers
+  getExtensionStatus: () => invoke<ExtensionStatus>("get_extension_status"),
+  openBrowserExtensions: (browser?: string) =>
+    invoke<void>("open_browser_extensions", { browser: browser ?? null }),
+  revealExtensionDir: () => invoke<void>("reveal_extension_dir"),
   /// Requests parked before the window was listening (a link spool was
   /// launched with, or a capture during startup), oldest first.
   pendingConfirms: () => invoke<ConfirmRequest[]>("pending_confirms"),

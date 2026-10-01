@@ -81,20 +81,23 @@ the new name.
 
 ### The browser extension
 
-Not on any store — load it unpacked:
+Load it unpacked into Chrome, Brave, Chromium, Edge, Vivaldi, or Firefox:
 
-1. `chrome://extensions` (or `brave://extensions`)
-2. Turn on **Developer mode**
-3. **Load unpacked** → select the `extension/` directory
+1. Launch spool once. It automatically installs the extension to
+   `~/.local/share/com.saikarthik.spool/extension` and registers native messaging
+   hosts across native, Flatpak, and Snap browser profiles.
+2. Open **Settings → Browser Integration** in spool.
+3. Click **Copy** to copy the extension folder path, then click
+   **Extensions Page** (`chrome://extensions` or `about:addons`).
+4. Turn on **Developer mode** and click **Load unpacked** (or **Load Temporary Add-on**
+   in Firefox `about:debugging`), selecting the copied directory.
+5. The integration badge turns green automatically once connected.
 
 It talks to the app through native messaging: the browser launches spool as
-the extension's "native host", which relays to the running app over a socket in
-`$XDG_RUNTIME_DIR`. The app registers that host with Chrome, Chromium, Brave,
-Edge and Vivaldi each time it starts, and only this extension's ID may use it,
-so web pages cannot reach the app. The app has to be running for the extension
-to hand anything over; if it is not, the extension leaves the download to the
-browser rather than losing it. Launch the app once before loading the
-extension so the host is registered.
+the extension's native host, which relays to the running app over a socket in
+`$XDG_RUNTIME_DIR`. The host manifest is restricted to this extension's pinned ID,
+so web pages cannot reach the app. If spool is closed, the extension leaves the
+download to the browser rather than losing it.
 
 ---
 

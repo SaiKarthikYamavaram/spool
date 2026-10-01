@@ -7,7 +7,7 @@
 //! all touching the queue, it would deadlock reliably.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -243,6 +243,8 @@ pub struct AppState {
     pending: Mutex<HashMap<String, PendingAdd>>,
     /// Set when progress moved; a single flusher persists it (see `mark_dirty`).
     dirty: std::sync::atomic::AtomicBool,
+    /// Epoch timestamp (seconds) when the browser extension last pinged or communicated.
+    last_extension_ping: AtomicU64,
     /// The BitTorrent session, started the first time a torrent is added.
     /// Never started otherwise: it opens a listening port and joins the DHT,
     /// which a user who only downloads over HTTP has not asked for.
@@ -282,9 +284,22 @@ impl AppState {
             throttle: Mutex::new(Throttle::unlimited()),
             pending: Mutex::new(HashMap::new()),
             dirty: std::sync::atomic::AtomicBool::new(false),
+            last_extension_ping: AtomicU64::new(0),
             data_dir,
             config_dir,
         })
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    pub fn record_extension_ping(&self) {
+        self.last_extension_ping.store(crate::queue::now_secs(), Ordering::Relaxed);
+    }
+
+    pub fn last_extension_ping(&self) -> u64 {
+        self.last_extension_ping.load(Ordering::Relaxed)
     }
 
     /// Build a client pair carrying whatever cookies apply to this URL.

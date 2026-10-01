@@ -17,6 +17,8 @@ APP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 ICON_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor"
 AUTOSTART="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$APP.desktop"
 LEGACY_AUTOSTART="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$LEGACY.desktop"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/com.saikarthik.spool"
+EXT_DIR="$DATA_DIR/extension"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 release="$here/src-tauri/target/release"
@@ -50,8 +52,10 @@ purge_legacy() {
 
 uninstall() {
   rm -f "$BIN_DIR/$APP" "$APP_DIR/$APP.desktop" "$AUTOSTART"
+  rm -rf "$EXT_DIR"
   # The app registers itself as the browser extension's native host at launch.
-  rm -f "${XDG_CONFIG_HOME:-$HOME/.config}"/{google-chrome,google-chrome-beta,google-chrome-unstable,chromium,BraveSoftware/Brave-Browser,microsoft-edge,vivaldi}/NativeMessagingHosts/com.saikarthik.spool.json
+  rm -f "${XDG_CONFIG_HOME:-$HOME/.config}"/{google-chrome,google-chrome-beta,google-chrome-unstable,chromium,BraveSoftware/Brave-Browser,microsoft-edge,microsoft-edge-beta,microsoft-edge-dev,vivaldi,opera}/NativeMessagingHosts/com.saikarthik.spool.json
+  rm -f "$HOME/.mozilla/native-messaging-hosts/com.saikarthik.spool.json"
   find "$ICON_ROOT" \( -name "$APP.png" -o -name "$APP.svg" \) -delete 2>/dev/null || true
   purge_legacy
   command -v update-desktop-database >/dev/null && update-desktop-database "$APP_DIR" 2>/dev/null || true
@@ -105,6 +109,13 @@ if [[ -e "$icons/mark.svg" ]]; then
 fi
 
 say "Installed icons under $ICON_ROOT"
+
+if [[ -d "$here/extension" ]]; then
+  rm -rf "$EXT_DIR"
+  install -d "$EXT_DIR"
+  cp -r "$here/extension/." "$EXT_DIR/"
+  say "Installed browser extension to $EXT_DIR"
+fi
 
 install -d "$APP_DIR"
 cat > "$APP_DIR/$APP.desktop" <<EOF

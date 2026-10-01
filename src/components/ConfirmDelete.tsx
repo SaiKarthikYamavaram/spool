@@ -5,7 +5,6 @@ import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
 } from "./ui/alert-dialog";
-import { buttonVariants } from "./ui/button";
 
 /// Removing an entry has two distinct meanings, so ask which. "Remove from
 /// list" keeps the downloaded file; "Delete file too" erases it from disk.
@@ -55,11 +54,11 @@ export function ConfirmDelete({
         </AlertDialogHeader>
         <AlertDialogFooter>
           <AlertDialogCancel>Cancel</AlertDialogCancel>
-          <AlertDialogAction className={buttonVariants({ variant: "outline" })} onClick={removeOnly}>
+          <AlertDialogAction variant="secondary" onClick={removeOnly}>
             Remove from list
           </AlertDialogAction>
-          <AlertDialogAction className={buttonVariants({ variant: "destructive" })} onClick={deleteFile}>
-            <Trash2 /> {many ? "Delete files" : "Delete file"}
+          <AlertDialogAction variant="destructive" onClick={deleteFile}>
+            <Trash2 className="size-4" /> {many ? "Delete files" : "Delete file"}
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>

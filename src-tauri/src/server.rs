@@ -36,6 +36,9 @@ pub const HOST_NAME: &str = "com.saikarthik.spool";
 /// the same ID on every machine and the host manifest can name it.
 pub const EXTENSION_ID: &str = "mlddhjdhcladccjcgffcmeonbjhkhhlo";
 
+/// Firefox extension ID pinned in extension/manifest.json under browser_specific_settings.
+pub const FIREFOX_EXTENSION_ID: &str = "spool@saikarthik.com";
+
 /// A captured session is a URL and a cookie header; anything near this size is
 /// not one.
 const MAX_MESSAGE: usize = 64 * 1024;
@@ -76,10 +79,27 @@ fn socket_path() -> Option<PathBuf> {
         .map(|dir| dir.join("spool.sock"))
 }
 
-/// Whether the browser launched this process as the native host. Chrome passes
-/// the calling extension's origin as the first argument.
+/// Whether the browser launched this process as the native host.
+/// Chrome passes the calling extension's origin as the first argument;
+/// Firefox passes the manifest path as the first argument and the extension ID as the second.
 pub fn launched_as_host() -> bool {
-    std::env::args().nth(1).is_some_and(|a| a.starts_with("chrome-extension://"))
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 {
+        let a1 = &args[1];
+        if a1.starts_with("chrome-extension://")
+            || a1.ends_with(&format!("{HOST_NAME}.json"))
+            || a1 == "--native-host"
+        {
+            return true;
+        }
+    }
+    if args.len() > 2 {
+        let a2 = &args[2];
+        if a2 == FIREFOX_EXTENSION_ID || a2.starts_with("chrome-extension://") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Relay the browser's stdin/stdout to the running app until either side
@@ -120,28 +140,129 @@ fn relay(mut from: impl std::io::Read, mut to: impl std::io::Write) {
     }
 }
 
-/// Tell each installed Chromium-family browser where the host is. Rewritten on
-/// every launch, like the autostart entry, so a moved or reinstalled binary is
-/// picked up without a reinstall step. Not fatal: the app works without the
+struct BrowserTarget {
+    name: &'static str,
+    hosts_dir: PathBuf,
+    is_firefox: bool,
+}
+
+fn browser_targets() -> Vec<BrowserTarget> {
+    let mut targets = Vec::new();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".config")));
+
+    if let Some(config) = config {
+        // Native Chromium family
+        let chromium_browsers = [
+            ("google-chrome", "Google Chrome"),
+            ("google-chrome-beta", "Google Chrome Beta"),
+            ("google-chrome-unstable", "Google Chrome Dev"),
+            ("chromium", "Chromium"),
+            ("BraveSoftware/Brave-Browser", "Brave"),
+            ("microsoft-edge", "Microsoft Edge"),
+            ("microsoft-edge-beta", "Microsoft Edge Beta"),
+            ("microsoft-edge-dev", "Microsoft Edge Dev"),
+            ("vivaldi", "Vivaldi"),
+            ("opera", "Opera"),
+        ];
+        for (dir, name) in chromium_browsers {
+            let profile = config.join(dir);
+            if profile.is_dir() {
+                targets.push(BrowserTarget {
+                    name,
+                    hosts_dir: profile.join("NativeMessagingHosts"),
+                    is_firefox: false,
+                });
+            }
+        }
+    }
+
+    if let Some(home) = &home {
+        // Native Firefox / Gecko
+        let mozilla = home.join(".mozilla");
+        if mozilla.is_dir() {
+            targets.push(BrowserTarget {
+                name: "Firefox",
+                hosts_dir: mozilla.join("native-messaging-hosts"),
+                is_firefox: true,
+            });
+        }
+
+        // Flatpak browsers
+        let var_app = home.join(".var/app");
+        if var_app.is_dir() {
+            let flatpaks = [
+                ("com.brave.Browser/config/BraveSoftware/Brave-Browser", "Brave (Flatpak)", false),
+                ("com.google.Chrome/config/google-chrome", "Google Chrome (Flatpak)", false),
+                ("com.google.ChromeDev/config/google-chrome-unstable", "Google Chrome Dev (Flatpak)", false),
+                ("org.chromium.Chromium/config/chromium", "Chromium (Flatpak)", false),
+                ("com.microsoft.Edge/config/microsoft-edge", "Microsoft Edge (Flatpak)", false),
+                ("com.vivaldi.Vivaldi/config/vivaldi", "Vivaldi (Flatpak)", false),
+                ("com.opera.Opera/config/opera", "Opera (Flatpak)", false),
+                ("org.mozilla.firefox/.mozilla", "Firefox (Flatpak)", true),
+                ("org.mozilla.FirefoxDevEdition/.mozilla", "Firefox Dev (Flatpak)", true),
+                ("app.zen_browser.zen/.zen", "Zen Browser (Flatpak)", true),
+                ("app.zen_browser.zen/.mozilla", "Zen Browser (Flatpak)", true),
+                ("one.ablaze.floorp/.floorp", "Floorp (Flatpak)", true),
+                ("one.ablaze.floorp/.mozilla", "Floorp (Flatpak)", true),
+                ("io.gitlab.librewolf-community/.librewolf", "LibreWolf (Flatpak)", true),
+                ("io.gitlab.librewolf-community/.mozilla", "LibreWolf (Flatpak)", true),
+            ];
+            for (rel, name, is_firefox) in flatpaks {
+                let profile = var_app.join(rel);
+                if profile.is_dir() {
+                    let hosts_dir = if is_firefox {
+                        profile.join("native-messaging-hosts")
+                    } else {
+                        profile.join("NativeMessagingHosts")
+                    };
+                    targets.push(BrowserTarget {
+                        name,
+                        hosts_dir,
+                        is_firefox,
+                    });
+                }
+            }
+        }
+
+        // Snap browsers
+        let snap = home.join("snap");
+        if snap.is_dir() {
+            let snaps = [
+                ("chromium/current/.config/chromium", "Chromium (Snap)", false),
+                ("brave/current/.config/BraveSoftware/Brave-Browser", "Brave (Snap)", false),
+                ("edge/current/.config/microsoft-edge", "Microsoft Edge (Snap)", false),
+                ("firefox/common/.mozilla", "Firefox (Snap)", true),
+            ];
+            for (rel, name, is_firefox) in snaps {
+                let profile = snap.join(rel);
+                if profile.is_dir() {
+                    let hosts_dir = if is_firefox {
+                        profile.join("native-messaging-hosts")
+                    } else {
+                        profile.join("NativeMessagingHosts")
+                    };
+                    targets.push(BrowserTarget {
+                        name,
+                        hosts_dir,
+                        is_firefox,
+                    });
+                }
+            }
+        }
+    }
+
+    targets
+}
+
+/// Tell each installed Chromium-family and Firefox browser where the host is.
+/// Rewritten on every launch, like the autostart entry, so a moved or reinstalled
+/// binary is picked up without a reinstall step. Not fatal: the app works without the
 /// extension.
 #[cfg(target_os = "linux")]
 pub fn register_host() {
-    const BROWSERS: &[&str] = &[
-        "google-chrome",
-        "google-chrome-beta",
-        "google-chrome-unstable",
-        "chromium",
-        "BraveSoftware/Brave-Browser",
-        "microsoft-edge",
-        "vivaldi",
-    ];
-
-    let Some(config) = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-    else {
-        return;
-    };
     // An AppImage runs from a mount point that changes every launch; the
     // browser has to be pointed at the AppImage file itself.
     let Some(exe) = std::env::var_os("APPIMAGE")
@@ -150,18 +271,20 @@ pub fn register_host() {
     else {
         return;
     };
-    let manifest = host_manifest(&exe);
+    let chrome_manifest = host_manifest(&exe);
+    let firefox_manifest = firefox_host_manifest(&exe);
 
-    for browser in BROWSERS {
-        let profile = config.join(browser);
-        if !profile.is_dir() {
-            continue; // not installed
-        }
-        let hosts = profile.join("NativeMessagingHosts");
-        let written = std::fs::create_dir_all(&hosts)
-            .and_then(|_| std::fs::write(hosts.join(format!("{HOST_NAME}.json")), &manifest));
+    for target in browser_targets() {
+        let manifest = if target.is_firefox {
+            &firefox_manifest
+        } else {
+            &chrome_manifest
+        };
+        let file = target.hosts_dir.join(format!("{HOST_NAME}.json"));
+        let written = std::fs::create_dir_all(&target.hosts_dir)
+            .and_then(|_| std::fs::write(&file, manifest));
         if let Err(e) = written {
-            eprintln!("spool: could not register the extension host for {browser}: {e}");
+            eprintln!("spool: could not register the extension host for {}: {e}", target.name);
         }
     }
 }
@@ -171,7 +294,22 @@ pub fn register_host() {
 #[cfg(not(target_os = "linux"))]
 pub fn register_host() {}
 
-fn host_manifest(exe: &std::path::Path) -> String {
+/// Returns the names of all browsers that currently have the host manifest registered.
+pub fn registered_browsers() -> Vec<String> {
+    let mut names = Vec::new();
+    for target in browser_targets() {
+        let file = target.hosts_dir.join(format!("{HOST_NAME}.json"));
+        if file.exists() {
+            let n = target.name.to_string();
+            if !names.contains(&n) {
+                names.push(n);
+            }
+        }
+    }
+    names
+}
+
+pub fn host_manifest(exe: &std::path::Path) -> String {
     serde_json::to_string_pretty(&json!({
         "name": HOST_NAME,
         "description": "spool download manager",
@@ -180,6 +318,66 @@ fn host_manifest(exe: &std::path::Path) -> String {
         "allowed_origins": [format!("chrome-extension://{EXTENSION_ID}/")],
     }))
     .unwrap()
+}
+
+pub fn firefox_host_manifest(exe: &std::path::Path) -> String {
+    serde_json::to_string_pretty(&json!({
+        "name": HOST_NAME,
+        "description": "spool download manager",
+        "path": exe,
+        "type": "stdio",
+        "allowed_extensions": [FIREFOX_EXTENSION_ID],
+    }))
+    .unwrap()
+}
+
+/// Canonical path where the extension files should live on the user's system.
+pub fn canonical_extension_dir(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("extension")
+}
+
+/// Ensure the canonical extension directory exists and contains manifest.json.
+/// If not present, populates it from candidate source locations (git repo, exe parent, /usr/share).
+pub fn ensure_canonical_extension(data_dir: &std::path::Path) {
+    let dest = data_dir.join("extension");
+    if dest.join("manifest.json").exists() {
+        return;
+    }
+    let mut candidates = vec![
+        PathBuf::from("extension"),
+        PathBuf::from("../extension"),
+    ];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("extension"));
+            candidates.push(parent.join("../extension"));
+            candidates.push(parent.join("../../extension"));
+            candidates.push(parent.join("../share/spool/extension"));
+        }
+    }
+    candidates.push(PathBuf::from("/usr/share/spool/extension"));
+
+    for candidate in candidates {
+        if candidate.join("manifest.json").exists() {
+            let _ = copy_dir_all(&candidate, &dest);
+            break;
+        }
+    }
+}
+
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            let _ = std::fs::copy(entry.path(), target);
+        }
+    }
+    Ok(())
 }
 
 /// Listen for host connections for the life of the app. A bind failure is not
@@ -243,6 +441,8 @@ where
     // An oversized or truncated frame ends the connection; the extension sees
     // the host exit and reports the handover as failed.
     while let Ok(Some(body)) = read_frame(&mut stream).await {
+        state.record_extension_ping();
+        let _ = app.emit("extension://status", ());
         let reply = match parse_message(&body) {
             Ok(Message::Ping) => json!({ "ok": true }),
             Ok(Message::Add(req)) => match handle_add(&app, &state, req).await {
@@ -465,6 +665,15 @@ mod tests {
         assert_eq!(m["path"], "/opt/spool");
         assert_eq!(m["type"], "stdio");
         assert_eq!(m["allowed_origins"], json!([format!("chrome-extension://{EXTENSION_ID}/")]));
+    }
+
+    #[test]
+    fn firefox_host_manifest_allows_only_firefox_extension() {
+        let m: Value = serde_json::from_str(&firefox_host_manifest(std::path::Path::new("/opt/spool"))).unwrap();
+        assert_eq!(m["name"], HOST_NAME);
+        assert_eq!(m["path"], "/opt/spool");
+        assert_eq!(m["type"], "stdio");
+        assert_eq!(m["allowed_extensions"], json!([FIREFOX_EXTENSION_ID]));
     }
 
     /// The extension sends "" for a header it could not read. An empty

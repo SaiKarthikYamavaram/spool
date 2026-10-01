@@ -618,6 +618,72 @@ async fn update_settings(app: AppHandle, state: Shared<'_>, settings: Settings) 
     Ok(())
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExtensionStatus {
+    pub connected: bool,
+    pub last_seen_secs_ago: Option<u64>,
+    pub canonical_path: String,
+    pub registered_browsers: Vec<String>,
+}
+
+#[tauri::command]
+fn get_extension_status(state: Shared<'_>) -> ExtensionStatus {
+    let canonical = server::canonical_extension_dir(state.data_dir());
+    let last = state.last_extension_ping();
+    let now = queue::now_secs();
+    let connected = last > 0 && now.saturating_sub(last) < 15;
+    let last_seen_secs_ago = if last > 0 { Some(now.saturating_sub(last)) } else { None };
+    let registered_browsers = server::registered_browsers();
+
+    ExtensionStatus {
+        connected,
+        last_seen_secs_ago,
+        canonical_path: canonical.display().to_string(),
+        registered_browsers,
+    }
+}
+
+#[tauri::command]
+async fn open_browser_extensions(browser: Option<String>) -> Result<(), String> {
+    let target = match browser.as_deref() {
+        Some("firefox") => "about:addons",
+        _ => "chrome://extensions",
+    };
+    if let Some(b) = browser.as_deref() {
+        let bin = match b {
+            "chrome" | "google-chrome" => "google-chrome",
+            "brave" => "brave",
+            "chromium" => "chromium",
+            "edge" | "microsoft-edge" => "microsoft-edge",
+            "firefox" => "firefox",
+            _ => b,
+        };
+        if let Ok(mut child) = std::process::Command::new(bin).arg(target).spawn() {
+            let _ = child.wait();
+            return Ok(());
+        }
+    }
+    for cmd in ["brave", "google-chrome", "chromium", "microsoft-edge", "firefox"] {
+        let arg = if cmd == "firefox" { "about:addons" } else { "chrome://extensions" };
+        if let Ok(mut child) = std::process::Command::new(cmd).arg(arg).spawn() {
+            let _ = child.wait();
+            return Ok(());
+        }
+    }
+    Err("Could not launch browser extensions page".to_string())
+}
+
+#[tauri::command]
+fn reveal_extension_dir(state: Shared<'_>) -> Result<(), String> {
+    let canonical = server::canonical_extension_dir(state.data_dir());
+    let _ = std::fs::create_dir_all(&canonical);
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(&canonical).spawn();
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // The browser starts this binary as the extension's native host; relay and
@@ -682,6 +748,7 @@ pub fn run() {
             }
             remove_legacy_autostart();
 
+            server::ensure_canonical_extension(&data_dir);
             let state = Arc::new(AppState::new(data_dir, config_dir).map_err(std::io::Error::other)?);
             app.manage(Arc::clone(&state));
 
@@ -910,6 +977,9 @@ pub fn run() {
             clear_history,
             get_settings,
             update_settings,
+            get_extension_status,
+            open_browser_extensions,
+            reveal_extension_dir,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

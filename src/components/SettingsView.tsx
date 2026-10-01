@@ -1,6 +1,24 @@
 import { useEffect, useRef, useState } from "react";
-import { Clipboard, Clock, Folder, Gauge, Monitor, Moon, Power, ShieldAlert, Sun, Video } from "lucide-react";
-import { api, type Settings } from "../lib/api";
+import {
+  Check,
+  Clipboard,
+  Clock,
+  Copy,
+  ExternalLink,
+  Folder,
+  FolderOpen,
+  Gauge,
+  Monitor,
+  Moon,
+  Power,
+  Puzzle,
+  ShieldAlert,
+  Sparkles,
+  Sun,
+  Video,
+} from "lucide-react";
+import { listen } from "@tauri-apps/api/event";
+import { api, type ExtensionStatus, type Settings } from "../lib/api";
 import { applyTheme } from "../lib/theme";
 import { cn } from "cn";
 import { Badge } from "./ui/badge";
@@ -48,8 +66,35 @@ function Section({
 export function SettingsView() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [saved, setSaved] = useState(false);
+  const [extStatus, setExtStatus] = useState<ExtensionStatus | null>(null);
+  const [copiedPath, setCopiedPath] = useState(false);
   const debounceTimer = useRef<number | null>(null);
   const latestSettings = useRef<Settings | null>(null);
+
+  useEffect(() => {
+    api.getExtensionStatus().then(setExtStatus).catch(() => {});
+    const unlistenPromise = listen("extension://status", () => {
+      api.getExtensionStatus().then(setExtStatus).catch(() => {});
+    });
+    const interval = window.setInterval(() => {
+      api.getExtensionStatus().then(setExtStatus).catch(() => {});
+    }, 4000);
+    return () => {
+      window.clearInterval(interval);
+      unlistenPromise.then((u) => u());
+    };
+  }, []);
+
+  async function copyExtensionPath() {
+    if (!extStatus?.canonical_path) return;
+    try {
+      await navigator.clipboard.writeText(extStatus.canonical_path);
+      setCopiedPath(true);
+      window.setTimeout(() => setCopiedPath(false), 2000);
+    } catch {
+      // ignore
+    }
+  }
 
   useEffect(() => {
     api.getSettings().then((s) => {
@@ -190,6 +235,160 @@ export function SettingsView() {
               </button>
             ))}
           </div>
+        </div>
+      </Section>
+
+      <Section icon={<Puzzle className="size-3.5" />} title="Browser Integration & Extension">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3.5 rounded-lg border border-border/70 bg-muted/20">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold">Integration Status</span>
+              {extStatus?.connected ? (
+                <Badge className="bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30 gap-1.5 py-0.5">
+                  <span className="size-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                  Connected & Active
+                </Badge>
+              ) : (extStatus?.registered_browsers.length ?? 0) > 0 ? (
+                <Badge className="bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30 gap-1.5 py-0.5">
+                  <span className="size-1.5 rounded-full bg-amber-500" />
+                  Host Ready (Extension Needed)
+                </Badge>
+              ) : (
+                <Badge variant="outline" className="gap-1.5 py-0.5 text-muted-foreground">
+                  <span className="size-1.5 rounded-full bg-muted-foreground" />
+                  Not Configured
+                </Badge>
+              )}
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {extStatus?.connected
+                ? "The extension is communicating with spool. Browser downloads & cookies are forwarded automatically."
+                : (extStatus?.registered_browsers.length ?? 0) > 0
+                ? `Native host registered for ${extStatus!.registered_browsers.join(", ")}. Follow the quick steps below to load the extension.`
+                : "No supported browsers detected. Spool registers native hosts for Chrome, Brave, Chromium, Edge, and Firefox."}
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => api.openBrowserExtensions().catch(() => {})}
+              className="text-xs h-8"
+            >
+              <ExternalLink className="size-3.5 mr-1" />
+              Extensions Page
+            </Button>
+          </div>
+        </div>
+
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between">
+            <Label className="text-xs font-medium">Extension Folder Path</Label>
+            <span className="text-[11px] text-muted-foreground">Stable permanent directory</span>
+          </div>
+          <div className="flex gap-2">
+            <Input
+              readOnly
+              value={extStatus?.canonical_path ?? "Loading path..."}
+              className="font-mono text-xs bg-muted/40 select-all"
+            />
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={copyExtensionPath}
+              className="shrink-0 text-xs gap-1.5"
+            >
+              {copiedPath ? <Check className="size-3.5 text-emerald-500" /> : <Copy className="size-3.5" />}
+              {copiedPath ? "Copied!" : "Copy"}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => api.revealExtensionDir().catch(() => {})}
+              className="shrink-0 text-xs gap-1.5"
+            >
+              <FolderOpen className="size-3.5" />
+              Open
+            </Button>
+          </div>
+        </div>
+
+        <div className="rounded-lg border border-border/60 bg-card/40 p-3.5 space-y-3">
+          <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-1.5">
+            <Sparkles className="size-3.5 text-primary" />
+            Quick Setup (Chrome, Brave, Edge & Firefox)
+          </p>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+            <div className="flex flex-col justify-between rounded-md border border-border/50 bg-background/50 p-2.5 space-y-2">
+              <div className="space-y-1">
+                <div className="flex items-center gap-1.5 font-semibold text-xs">
+                  <span className="flex size-4 items-center justify-center rounded-full bg-primary/10 text-primary text-[10px]">1</span>
+                  Open Extensions
+                </div>
+                <p className="text-[11px] text-muted-foreground leading-relaxed">
+                  Open your browser's extension manager.
+                </p>
+              </div>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={() => api.openBrowserExtensions().catch(() => {})}
+                className="text-xs h-7 w-full gap-1 mt-1"
+              >
+                <ExternalLink className="size-3" />
+                chrome://extensions
+              </Button>
+            </div>
+
+            <div className="flex flex-col justify-between rounded-md border border-border/50 bg-background/50 p-2.5 space-y-2">
+              <div className="space-y-1">
+                <div className="flex items-center gap-1.5 font-semibold text-xs">
+                  <span className="flex size-4 items-center justify-center rounded-full bg-primary/10 text-primary text-[10px]">2</span>
+                  Enable Developer Mode
+                </div>
+                <p className="text-[11px] text-muted-foreground leading-relaxed">
+                  Turn on the <strong>Developer mode</strong> toggle in the top-right corner.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex flex-col justify-between rounded-md border border-border/50 bg-background/50 p-2.5 space-y-2">
+              <div className="space-y-1">
+                <div className="flex items-center gap-1.5 font-semibold text-xs">
+                  <span className="flex size-4 items-center justify-center rounded-full bg-primary/10 text-primary text-[10px]">3</span>
+                  Load Unpacked
+                </div>
+                <p className="text-[11px] text-muted-foreground leading-relaxed">
+                  Click <strong>Load unpacked</strong> and select the copied folder path.
+                </p>
+              </div>
+              <Button
+                type="button"
+                size="sm"
+                variant="secondary"
+                onClick={copyExtensionPath}
+                className="text-xs h-7 w-full gap-1 mt-1"
+              >
+                {copiedPath ? <Check className="size-3 text-emerald-500" /> : <Copy className="size-3" />}
+                {copiedPath ? "Path Copied" : "Copy Path"}
+              </Button>
+            </div>
+          </div>
+
+          {(extStatus?.registered_browsers.length ?? 0) > 0 && (
+            <div className="pt-2 border-t border-border/40 flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
+              <span>Registered browsers:</span>
+              {extStatus!.registered_browsers.map((b) => (
+                <Badge key={b} variant="secondary" className="text-[11px] font-normal py-0 px-2">
+                  {b}
+                </Badge>
+              ))}
+            </div>
+          )}
         </div>
       </Section>
 

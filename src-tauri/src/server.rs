@@ -102,6 +102,12 @@ pub fn launched_as_host() -> bool {
     false
 }
 
+#[cfg(windows)]
+fn pipe_name() -> String {
+    let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".to_string());
+    format!(r"\\.\pipe\spool-native-host-{user}")
+}
+
 /// Relay the browser's stdin/stdout to the running app until either side
 /// closes. Exits without a reply when the app is not running, which the
 /// extension reads as "not reachable" and leaves the download to the browser.
@@ -123,6 +129,43 @@ pub fn run_host() {
     relay(&socket, std::io::stdout().lock());
 }
 
+#[cfg(windows)]
+pub fn run_host() {
+    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(_) => std::process::exit(1),
+    };
+    rt.block_on(async {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::windows::named_pipe::ClientOptions;
+
+        let pipe_name = pipe_name();
+        let client = match ClientOptions::new().open(&pipe_name) {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("spool: the app is not running");
+                std::process::exit(1);
+            }
+        };
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let mut stdin = tokio::io::stdin();
+        let mut stdout = tokio::io::stdout();
+
+        let up = tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut stdin, &mut client_write).await;
+            let _ = client_write.shutdown().await;
+        });
+        let down = tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut client_read, &mut stdout).await;
+            let _ = stdout.flush().await;
+        });
+        let _ = tokio::join!(up, down);
+    });
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn run_host() {}
+
 /// Copy until EOF, flushing each chunk. `io::copy` into stdout would sit on a
 /// reply that has no trailing newline until the process exits, and the
 /// browser waits for that reply before it closes stdin — a deadlock.
@@ -140,12 +183,14 @@ fn relay(mut from: impl std::io::Read, mut to: impl std::io::Write) {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct BrowserTarget {
     name: &'static str,
     hosts_dir: PathBuf,
     is_firefox: bool,
 }
 
+#[cfg(target_os = "linux")]
 fn browser_targets() -> Vec<BrowserTarget> {
     let mut targets = Vec::new();
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -289,12 +334,47 @@ pub fn register_host() {
     }
 }
 
-// ponytail: Linux only; macOS wants ~/Library/Application Support/<browser>/
-// NativeMessagingHosts and Windows a registry key, add them if spool ships there.
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+pub fn register_host() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let host_dir = exe.parent().unwrap_or(std::path::Path::new(".")).join("native-messaging-hosts");
+    let _ = std::fs::create_dir_all(&host_dir);
+
+    let chrome_manifest_path = host_dir.join("com.saikarthik.spool.json");
+    let firefox_manifest_path = host_dir.join("com.saikarthik.spool-firefox.json");
+
+    let _ = std::fs::write(&chrome_manifest_path, host_manifest(&exe));
+    let _ = std::fs::write(&firefox_manifest_path, firefox_host_manifest(&exe));
+
+    let chrome_path_str = chrome_manifest_path.to_string_lossy();
+    let firefox_path_str = firefox_manifest_path.to_string_lossy();
+
+    let targets = [
+        (r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.saikarthik.spool", &chrome_path_str),
+        (r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.saikarthik.spool", &chrome_path_str),
+        (r"HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.saikarthik.spool", &chrome_path_str),
+        (r"HKCU\Software\Vivaldi\NativeMessagingHosts\com.saikarthik.spool", &chrome_path_str),
+        (r"HKCU\Software\Opera Software\Opera Stable\NativeMessagingHosts\com.saikarthik.spool", &chrome_path_str),
+        (r"HKCU\Software\Mozilla\NativeMessagingHosts\com.saikarthik.spool", &firefox_path_str),
+    ];
+
+    for (key, path) in targets {
+        let mut cmd = std::process::Command::new("reg");
+        cmd.args(["add", key, "/ve", "/t", "REG_SZ", "/d", path, "/f"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        let _ = cmd.spawn();
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn register_host() {}
 
 /// Returns the names of all browsers that currently have the host manifest registered.
+#[cfg(target_os = "linux")]
 pub fn registered_browsers() -> Vec<String> {
     let mut names = Vec::new();
     for target in browser_targets() {
@@ -307,6 +387,40 @@ pub fn registered_browsers() -> Vec<String> {
         }
     }
     names
+}
+
+#[cfg(target_os = "windows")]
+pub fn registered_browsers() -> Vec<String> {
+    let mut names = Vec::new();
+    let targets = [
+        ("Google Chrome", r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.saikarthik.spool"),
+        ("Microsoft Edge", r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.saikarthik.spool"),
+        ("Brave", r"HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.saikarthik.spool"),
+        ("Vivaldi", r"HKCU\Software\Vivaldi\NativeMessagingHosts\com.saikarthik.spool"),
+        ("Opera", r"HKCU\Software\Opera Software\Opera Stable\NativeMessagingHosts\com.saikarthik.spool"),
+        ("Firefox", r"HKCU\Software\Mozilla\NativeMessagingHosts\com.saikarthik.spool"),
+    ];
+
+    for (name, key) in targets {
+        let mut cmd = std::process::Command::new("reg");
+        cmd.args(["query", key, "/ve"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        if let Ok(status) = cmd.status() {
+            if status.success() {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn registered_browsers() -> Vec<String> {
+    Vec::new()
 }
 
 pub fn host_manifest(exe: &std::path::Path) -> String {
@@ -426,11 +540,45 @@ pub fn start(app: AppHandle, state: Arc<AppState>) {
     });
 }
 
-// ponytail: Unix only; a Windows build needs a named pipe here and a registry
-// entry in `register_host`.
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn start(app: AppHandle, state: Arc<AppState>) {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    let pipe_name = pipe_name();
+    tauri::async_runtime::spawn(async move {
+        let mut server = match ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("spool: extension bridge disabled, cannot bind {pipe_name}: {e}");
+                return;
+            }
+        };
+
+        loop {
+            if let Err(e) = server.connect().await {
+                eprintln!("spool: named pipe connect failed: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                continue;
+            }
+            let connected = server;
+            server = match ServerOptions::new().create(&pipe_name) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("spool: cannot create next pipe instance: {e}");
+                    break;
+                }
+            };
+            tauri::async_runtime::spawn(serve(app.clone(), Arc::clone(&state), connected));
+        }
+    });
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn start(_app: AppHandle, _state: Arc<AppState>) {
-    eprintln!("spool: extension bridge is only built for Unix");
+    eprintln!("spool: extension bridge is only built for Unix and Windows");
 }
 
 /// Answer requests on one connection until the host hangs up.

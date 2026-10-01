@@ -49,7 +49,13 @@ pub async fn extract(ffmpeg: &str, video: &Path, out: &Path, duration_secs: Opti
         .map(|d| d * 0.2)
         .unwrap_or(1.0);
 
-    let status = Command::new(ffmpeg)
+    let mut cmd = Command::new(ffmpeg);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let status = cmd
         .arg("-nostdin")
         .arg("-loglevel").arg("error")
         .arg("-y")
@@ -81,7 +87,13 @@ pub async fn extract(ffmpeg: &str, video: &Path, out: &Path, duration_secs: Opti
 /// Read a video's duration, so the seek can be proportional. `None` when
 /// ffprobe is missing or the file has no duration (a stream, a broken mux).
 pub async fn duration(ffprobe: &str, video: &Path) -> Option<f64> {
-    let out = Command::new(ffprobe)
+    let mut cmd = Command::new(ffprobe);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let out = cmd
         .arg("-v").arg("error")
         .arg("-show_entries").arg("format=duration")
         .arg("-of").arg("default=noprint_wrappers=1:nokey=1")

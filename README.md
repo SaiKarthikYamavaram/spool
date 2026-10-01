@@ -41,13 +41,16 @@ tray with pause-all and resume-all, and a queue that survives a crash.
 |---|---|
 | `yt-dlp` | Required for video sites and stream manifests. Everything else works without it. |
 | `ffmpeg`, `ffprobe` | Optional. Used for poster frames, and by yt-dlp to mux video and audio streams. |
-| WebKitGTK 4.1 | The webview Tauri renders into. |
+| WebKitGTK 4.1 / WebView2 | The webview Tauri renders into (WebKitGTK on Linux, Microsoft Edge WebView2 on Windows). |
 
-On Arch: `sudo pacman -S yt-dlp ffmpeg webkit2gtk-4.1`
+- **Linux (Arch)**: `sudo pacman -S yt-dlp ffmpeg webkit2gtk-4.1`
+- **Windows**: `winget install yt-dlp Gyan.FFmpeg` (WebView2 is built into Windows 10/11)
 
 ---
 
 ## Install
+
+### Linux
 
 Build the release bundle and install it for your user — no root, nothing
 outside `~/.local`:
@@ -62,12 +65,21 @@ That puts the binary in `~/.local/bin/spool`, a desktop entry in
 `~/.local/share/applications`, and icons under `~/.local/share/icons`. Make
 sure `~/.local/bin` is on your `PATH`.
 
-`npm run tauri build` also leaves `.deb` and `.rpm` packages under
-`src-tauri/target/release/bundle/` if you would rather install one of those.
-The AppImage target needs `linuxdeploy` and its GTK plugin on `PATH`; without
-them that one bundle fails and the others still build.
-
 To remove it: `./install.sh --uninstall`.
+
+### Windows
+
+Build the release binary and run the PowerShell installer (no admin required):
+
+```powershell
+npm ci
+npm run tauri build -- --no-bundle
+.\install.ps1
+```
+
+This installs `spool.exe` to `$env:LOCALAPPDATA\Programs\spool`, registers browser native messaging hosts in the registry (Chrome, Edge, Brave, Firefox, etc.), adds Start Menu shortcuts, associates `magnet:` links, and adds `spool` to your user `PATH`.
+
+To remove it: `.\install.ps1 -Uninstall`.
 
 ### Upgrading from `fetchd`
 

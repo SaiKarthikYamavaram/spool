@@ -95,6 +95,11 @@ pub async fn resolve_meta(
     if let Some(p) = proxy.filter(|p| !p.is_empty()) {
         cmd.arg("--proxy").arg(p);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
     cmd.arg("--").arg(url).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
 
     let out = match tokio::time::timeout(Duration::from_secs(15), cmd.output()).await {
@@ -213,10 +218,15 @@ where
     #[cfg(unix)]
     cmd.process_group(0);
 
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("cannot start yt-dlp: {e} (is it installed?)"))?;
-    #[cfg(unix)]
     let child_pid = child.id();
 
     let stdout = child.stdout.take().expect("piped stdout");
@@ -250,6 +260,16 @@ where
                 #[cfg(unix)]
                 if let Some(pid) = child_pid {
                     unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
+                }
+                #[cfg(windows)]
+                if let Some(pid) = child_pid {
+                    let mut kill_cmd = std::process::Command::new("taskkill");
+                    kill_cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
+                    {
+                        use std::os::windows::process::CommandExt;
+                        kill_cmd.creation_flags(0x08000000);
+                    }
+                    let _ = kill_cmd.spawn();
                 }
                 let _ = child.kill().await;
                 let _ = child.wait().await;

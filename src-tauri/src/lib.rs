@@ -649,28 +649,61 @@ async fn open_browser_extensions(browser: Option<String>) -> Result<(), String> 
         Some("firefox") => "about:addons",
         _ => "chrome://extensions",
     };
-    if let Some(b) = browser.as_deref() {
-        let bin = match b {
-            "chrome" | "google-chrome" => "google-chrome",
-            "brave" => "brave",
-            "chromium" => "chromium",
-            "edge" | "microsoft-edge" => "microsoft-edge",
-            "firefox" => "firefox",
-            _ => b,
-        };
-        if let Ok(mut child) = std::process::Command::new(bin).arg(target).spawn() {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(b) = browser.as_deref() {
+            let bin = match b.to_lowercase().as_str() {
+                "chrome" | "google-chrome" => "chrome",
+                "brave" => "brave",
+                "edge" | "microsoft-edge" => "msedge",
+                "firefox" => "firefox",
+                "opera" => "opera",
+                "vivaldi" => "vivaldi",
+                _ => b,
+            };
+            if let Ok(mut child) = std::process::Command::new(bin).arg(target).spawn() {
+                let _ = child.wait();
+                return Ok(());
+            }
+        }
+        for cmd in ["chrome", "msedge", "brave", "firefox", "opera", "vivaldi"] {
+            let arg = if cmd == "firefox" { "about:addons" } else { "chrome://extensions" };
+            if let Ok(mut child) = std::process::Command::new(cmd).arg(arg).spawn() {
+                let _ = child.wait();
+                return Ok(());
+            }
+        }
+        if let Ok(mut child) = std::process::Command::new("cmd").args(["/c", "start", target]).spawn() {
             let _ = child.wait();
             return Ok(());
         }
+        return Ok(());
     }
-    for cmd in ["brave", "google-chrome", "chromium", "microsoft-edge", "firefox"] {
-        let arg = if cmd == "firefox" { "about:addons" } else { "chrome://extensions" };
-        if let Ok(mut child) = std::process::Command::new(cmd).arg(arg).spawn() {
-            let _ = child.wait();
-            return Ok(());
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Some(b) = browser.as_deref() {
+            let bin = match b {
+                "chrome" | "google-chrome" => "google-chrome",
+                "brave" => "brave",
+                "chromium" => "chromium",
+                "edge" | "microsoft-edge" => "microsoft-edge",
+                "firefox" => "firefox",
+                _ => b,
+            };
+            if let Ok(mut child) = std::process::Command::new(bin).arg(target).spawn() {
+                let _ = child.wait();
+                return Ok(());
+            }
         }
+        for cmd in ["brave", "google-chrome", "chromium", "microsoft-edge", "firefox"] {
+            let arg = if cmd == "firefox" { "about:addons" } else { "chrome://extensions" };
+            if let Ok(mut child) = std::process::Command::new(cmd).arg(arg).spawn() {
+                let _ = child.wait();
+                return Ok(());
+            }
+        }
+        Err("Could not launch browser extensions page".to_string())
     }
-    Err("Could not launch browser extensions page".to_string())
 }
 
 #[tauri::command]
@@ -681,6 +714,14 @@ fn reveal_extension_dir(state: Shared<'_>) -> Result<(), String> {
     {
         let _ = std::process::Command::new("xdg-open").arg(&canonical).spawn();
     }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer").arg(&canonical).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(&canonical).spawn();
+    }
     Ok(())
 }
 
@@ -688,7 +729,7 @@ fn reveal_extension_dir(state: Shared<'_>) -> Result<(), String> {
 pub fn run() {
     // The browser starts this binary as the extension's native host; relay and
     // exit before any of the app (or its single-instance check) starts.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if server::launched_as_host() {
         return server::run_host();
     }

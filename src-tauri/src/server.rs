@@ -88,6 +88,7 @@ pub fn launched_as_host() -> bool {
         let a1 = &args[1];
         if a1.starts_with("chrome-extension://")
             || a1.ends_with(&format!("{HOST_NAME}.json"))
+            || (a1.ends_with(".json") && a1.contains(HOST_NAME))
             || a1 == "--native-host"
         {
             return true;
@@ -136,7 +137,7 @@ pub fn run_host() {
         Err(_) => std::process::exit(1),
     };
     rt.block_on(async {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::windows::named_pipe::ClientOptions;
 
         let pipe_name = pipe_name();
@@ -152,12 +153,31 @@ pub fn run_host() {
         let mut stdout = tokio::io::stdout();
 
         let up = tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut stdin, &mut client_write).await;
+            let mut buf = [0u8; 8192];
+            loop {
+                match stdin.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if client_write.write_all(&buf[..n]).await.is_err() || client_write.flush().await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
             let _ = client_write.shutdown().await;
         });
         let down = tokio::spawn(async move {
-            let _ = tokio::io::copy(&mut client_read, &mut stdout).await;
-            let _ = stdout.flush().await;
+            let mut buf = [0u8; 8192];
+            loop {
+                match client_read.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if stdout.write_all(&buf[..n]).await.is_err() || stdout.flush().await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
         });
         let _ = tokio::join!(up, down);
     });
@@ -470,6 +490,17 @@ pub fn ensure_canonical_extension(data_dir: &std::path::Path) {
         }
     }
     candidates.push(PathBuf::from("/usr/share/spool/extension"));
+
+    #[cfg(windows)]
+    {
+        if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(&local_appdata).join("com.saikarthik.spool").join("extension"));
+            candidates.push(PathBuf::from(&local_appdata).join("Programs").join("spool").join("extension"));
+        }
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            candidates.push(PathBuf::from(&appdata).join("com.saikarthik.spool").join("extension"));
+        }
+    }
 
     for candidate in candidates {
         if candidate.join("manifest.json").exists() {

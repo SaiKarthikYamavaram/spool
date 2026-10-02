@@ -673,6 +673,28 @@ async fn open_browser_extensions(browser: Option<String>) -> Result<(), String> 
                 return Ok(());
             }
         }
+        let program_files = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
+        let program_files_x86 = std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".into());
+        let local_appdata = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| String::new());
+
+        let fallback_exes = [
+            format!(r"{program_files_x86}\Microsoft\Edge\Application\msedge.exe"),
+            format!(r"{program_files}\Microsoft\Edge\Application\msedge.exe"),
+            format!(r"{program_files}\Google\Chrome\Application\chrome.exe"),
+            format!(r"{local_appdata}\Google\Chrome\Application\chrome.exe"),
+            format!(r"{program_files}\BraveSoftware\Brave-Browser\Application\brave.exe"),
+            format!(r"{local_appdata}\BraveSoftware\Brave-Browser\Application\brave.exe"),
+            format!(r"{program_files}\Mozilla Firefox\firefox.exe"),
+        ];
+        for exe_path in fallback_exes {
+            if std::path::Path::new(&exe_path).exists() {
+                let arg = if exe_path.contains("Firefox") { "about:addons" } else { "chrome://extensions" };
+                if let Ok(mut child) = std::process::Command::new(&exe_path).arg(arg).spawn() {
+                    let _ = child.wait();
+                    return Ok(());
+                }
+            }
+        }
         if let Ok(mut child) = std::process::Command::new("cmd").args(["/c", "start", target]).spawn() {
             let _ = child.wait();
             return Ok(());

@@ -86,6 +86,10 @@ if ($Uninstall) {
     if (Test-Path $ExtDir) {
         Remove-Item -Path $ExtDir -Recurse -Force -ErrorAction SilentlyContinue
     }
+    $RoamingExtDir = Join-Path $env:APPDATA "com.saikarthik.spool\extension"
+    if (Test-Path $RoamingExtDir) {
+        Remove-Item -Path $RoamingExtDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 
     # Clean user PATH
     $UserPath = [Environment]::GetEnvironmentVariable("PATH", "User")
@@ -126,10 +130,17 @@ New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 Copy-Item -Path $ReleaseExe -Destination $BinPath -Force
 Write-Info "Installed $BinPath"
 
-# Copy browser extension to canonical directory
+# Copy browser extension to canonical directories
 if (Test-Path $ExtensionSource) {
-    New-Item -ItemType Directory -Path $ExtDir -Force | Out-Null
-    Copy-Item -Path "$ExtensionSource\*" -Destination $ExtDir -Recurse -Force
+    $TargetExtDirs = @(
+        $ExtDir,
+        (Join-Path $InstallDir "extension"),
+        (Join-Path $env:APPDATA "com.saikarthik.spool\extension")
+    )
+    foreach ($dir in $TargetExtDirs) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        Copy-Item -Path "$ExtensionSource\*" -Destination $dir -Recurse -Force
+    }
     Write-Info "Installed browser extension to $ExtDir"
 }
 

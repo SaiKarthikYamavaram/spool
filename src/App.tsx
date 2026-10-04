@@ -7,7 +7,7 @@ import {
   Disc, Download, ExternalLink, File, FileText, Folder, Image, ListChecks,
   Loader2, Magnet, MoreVertical, Music, Network, Package, Pause, Pencil, Play, Plus,
   Presentation, RotateCcw, Search, Sheet, Trash2, Type as TypeIcon,
-  Video, X,
+  Video, X, Zap,
 } from "lucide-react";
 import {
   api,
@@ -719,6 +719,10 @@ function App() {
                     <Play className="size-3" />
                     <span className="hidden sm:inline">Resume</span>
                   </Button>
+                  <Button size="sm" variant="outline" className="h-7 px-2 text-xs" onClick={() => api.bulk(selectedIds, "force_start").catch(report)} disabled={!canResume} title="Force start selected (bypass queue limits)">
+                    <Zap className="size-3" />
+                    <span className="hidden sm:inline">Force start</span>
+                  </Button>
                   <Button size="sm" variant="destructive" className="h-7 px-2 text-xs" onClick={() => setDeletingSelection(true)} disabled={selectedRows.length === 0} title="Remove selected">
                     <Trash2 className="size-3" />
                     <span className="hidden sm:inline">Remove</span>
@@ -1161,7 +1165,21 @@ const Row = memo(function Row({
           <Button variant="ghost" size="icon" className="size-8" title="Pause" onClick={() => api.pause(row.id).catch(onFail)}><Pause className="size-4" /></Button>
         )}
         {(row.status === "paused" || row.status === "interrupted") && (
-          <Button variant="ghost" size="icon" className="size-8" title="Resume" onClick={() => api.resume(row.id).catch(onFail)}><Play className="size-4" /></Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-8"
+            title="Resume (Shift+Click to Force start)"
+            onClick={(e) => {
+              if (e.shiftKey) {
+                api.forceStart(row.id).catch(onFail);
+              } else {
+                api.resume(row.id).catch(onFail);
+              }
+            }}
+          >
+            <Play className="size-4" />
+          </Button>
         )}
         {row.status === "failed" && (
           <Button variant="ghost" size="icon" className="size-8" title="Retry" onClick={() => api.retry(row.id).catch(onFail)}><RotateCcw className="size-4" /></Button>
@@ -1176,6 +1194,11 @@ const Row = memo(function Row({
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
+            {row.status !== "completed" && row.status !== "downloading" && (
+              <DropdownMenuItem onClick={() => api.forceStart(row.id).catch(onFail)}>
+                <Zap /> Force start
+              </DropdownMenuItem>
+            )}
             {row.status === "completed" && (
               <DropdownMenuItem onClick={() => api.revealFile(row.path).catch(onFail)}>
                 <Folder /> Open folder

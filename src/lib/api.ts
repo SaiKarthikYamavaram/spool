@@ -156,12 +156,14 @@ export const api = {
   isDuplicate: (url: string) => invoke<boolean>("is_duplicate", { url }),
   /// Apply one action to a whole selection in a single call, so the list
   /// re-renders once instead of once per row.
-  bulk: (ids: string[], action: "pause" | "resume" | "remove" | "remove_with_file") =>
+  bulk: (ids: string[], action: "pause" | "resume" | "force_start" | "remove" | "remove_with_file") =>
     invoke<void>("bulk_action", { ids, action }),
   /// Rename a download's file. Rejected while it is running.
   rename: (id: string, name: string) => invoke<void>("rename_download", { id, name }),
   pause: (id: string) => invoke<void>("pause_download", { id }),
   resume: (id: string) => invoke<void>("resume_download", { id }),
+  /// Immediately start downloading regardless of concurrency or queue limits.
+  forceStart: (id: string) => invoke<void>("force_start_download", { id }),
   cancel: (id: string) => invoke<void>("cancel_download", { id }),
   retry: (id: string) => invoke<void>("retry_download", { id }),
   /// Fetch a finished download again from scratch, overwriting the file.

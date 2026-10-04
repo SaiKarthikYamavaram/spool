@@ -164,6 +164,7 @@ pub struct AddOptions {
 pub enum BulkAction {
     Pause,
     Resume,
+    ForceStart,
     Remove,
     RemoveWithFile,
 }
@@ -1280,6 +1281,18 @@ impl AppState {
         Some(d.clone())
     }
 
+    /// Atomically claim a specific entry by id, bypassing concurrency limits.
+    /// Returns `None` if already running or completed.
+    pub fn claim_specific(&self, id: &str) -> Option<Download> {
+        let mut queue = self.queue.lock().unwrap();
+        let d = queue.iter_mut().find(|d| d.id == id)?;
+        if matches!(d.status, Status::Downloading | Status::Completed) {
+            return None;
+        }
+        d.status = Status::Downloading;
+        d.error = None;
+        Some(d.clone())
+    }
 }
 
 /// Start whatever the concurrency limit allows, then emit a batched update.
@@ -1302,6 +1315,21 @@ pub fn pump(app: &AppHandle, state: &Arc<AppState>) {
     emit_queue(app, state);
 }
 
+/// Immediately start a specific download, bypassing concurrency and queue limits.
+pub fn force_start(app: &AppHandle, state: &Arc<AppState>, id: &str) {
+    if let Some(entry) = state.claim_specific(id) {
+        spawn_transfer(app.clone(), Arc::clone(state), entry);
+    }
+}
+
+/// Immediately start multiple specific downloads, bypassing concurrency limits.
+pub fn bulk_force_start(app: &AppHandle, state: &Arc<AppState>, ids: &[String]) {
+    for id in ids {
+        if let Some(entry) = state.claim_specific(id) {
+            spawn_transfer(app.clone(), Arc::clone(state), entry);
+        }
+    }
+}
 
 fn spawn_transfer(app: AppHandle, state: Arc<AppState>, entry: Download) {
     let id = entry.id.clone();
@@ -2637,6 +2665,30 @@ mod tests {
         assert!(state.claim_next(2).is_none());
     }
 
+    #[test]
+    fn claim_specific_bypasses_concurrency() {
+        let state = app();
+        for i in 0..5 {
+            push(&state, &format!("f{i}"));
+        }
+
+        // Fill slots to max (2)
+        let _a = state.claim_next(2).unwrap();
+        let _b = state.claim_next(2).unwrap();
+        assert!(state.claim_next(2).is_none(), "slots full");
+
+        // Force start specific id "f4" even though max is 2 and 2 are running
+        let forced = state.claim_specific("f4").expect("claim_specific must bypass limit");
+        assert_eq!(forced.id, "f4");
+        assert_eq!(status_of(&state, "f4"), Status::Downloading);
+
+        // Cannot force start an already downloading entry
+        assert!(state.claim_specific("f4").is_none());
+
+        // Cannot force start a completed entry
+        state.set_status("f4", Status::Completed, None);
+        assert!(state.claim_specific("f4").is_none());
+    }
 
     /// A repeated claim of a single entry (what two racing pumps would attempt)
     /// yields it exactly once.
@@ -2697,6 +2749,7 @@ mod tests {
         for (wire, expect) in [
             ("\"pause\"", BulkAction::Pause),
             ("\"resume\"", BulkAction::Resume),
+            ("\"force_start\"", BulkAction::ForceStart),
             ("\"remove\"", BulkAction::Remove),
             ("\"remove_with_file\"", BulkAction::RemoveWithFile),
         ] {

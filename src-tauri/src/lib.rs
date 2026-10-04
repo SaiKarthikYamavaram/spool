@@ -170,6 +170,10 @@ fn resume_download(app: AppHandle, state: Shared<'_>, id: String) {
     state::pump(&app, &state);
 }
 
+#[tauri::command]
+fn force_start_download(app: AppHandle, state: Shared<'_>, id: String) {
+    state::force_start(&app, &state, &id);
+}
 
 #[tauri::command]
 fn cancel_download(app: AppHandle, state: Shared<'_>, id: String) {
@@ -316,9 +320,13 @@ fn hex(bytes: &[u8]) -> String {
 
 #[tauri::command]
 fn bulk_action(app: AppHandle, state: Shared<'_>, ids: Vec<String>, action: state::BulkAction) {
-    state.bulk(&ids, action);
-    // `pump` starts anything the removals freed a slot for, and emits.
-    state::pump(&app, &state);
+    if action == state::BulkAction::ForceStart {
+        state::bulk_force_start(&app, &state, &ids);
+    } else {
+        state.bulk(&ids, action);
+        // `pump` starts anything the removals freed a slot for, and emits.
+        state::pump(&app, &state);
+    }
 }
 
 #[tauri::command]
@@ -1053,6 +1061,7 @@ pub fn run() {
             is_duplicate,
             pause_download,
             resume_download,
+            force_start_download,
             cancel_download,
             retry_download,
             redownload,

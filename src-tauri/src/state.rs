@@ -151,12 +151,15 @@ pub struct AddOptions {
     pub name: Option<String>,
     /// Start immediately (default), or add it paused for later.
     pub start: Option<bool>,
+    /// BitTorrent: specific file IDs to download.
+    #[serde(default)]
+    pub only_files: Option<Vec<usize>>,
 }
 
 /// What a multi-row selection asks for. Sending the whole selection as one
 /// command keeps it to a single round trip and a single queue emit, rather than
 /// one of each per row.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BulkAction {
     Pause,
@@ -211,6 +214,10 @@ pub struct DownloadView {
     /// Remote thumbnail URL for a preview, if any.
     pub thumbnail: Option<String>,
     pub engine: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peers: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peers_total: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -218,6 +225,28 @@ pub struct ProgressRow {
     pub id: String,
     pub downloaded: u64,
     pub total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peers: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peers_total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_speed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uploaded: Option<u64>,
+}
+
+impl ProgressRow {
+    pub fn simple(id: String, downloaded: u64, total: Option<u64>) -> Self {
+        Self {
+            id,
+            downloaded,
+            total,
+            peers: None,
+            peers_total: None,
+            upload_speed: None,
+            uploaded: None,
+        }
+    }
 }
 
 /// A transfer currently occupying a slot.
@@ -249,6 +278,8 @@ pub struct AppState {
     /// Never started otherwise: it opens a listening port and joins the DHT,
     /// which a user who only downloads over HTTP has not asked for.
     torrent: tokio::sync::OnceCell<Arc<librqbit::Session>>,
+    /// Live or recently active torrent handles, keyed by download id.
+    torrent_handles: Mutex<HashMap<String, crate::torrent::ManagedTorrentHandle>>,
     data_dir: PathBuf,
     config_dir: PathBuf,
 }
@@ -278,6 +309,7 @@ impl AppState {
             next_id: AtomicU64::new(next + 1),
             gen: AtomicU64::new(1),
             torrent: tokio::sync::OnceCell::new(),
+            torrent_handles: Mutex::new(HashMap::new()),
             // Built unlimited here (this runs off the async runtime, and
             // Throttle spawns a task); `rebuild_throttle` applies the saved cap
             // from a runtime context during setup.
@@ -371,19 +403,44 @@ impl AppState {
         app: &AppHandle,
     ) -> Result<Arc<librqbit::Session>, String> {
         let dir = self.download_dir(app)?;
-        self.torrent
+        let session = self.torrent
             .get_or_try_init(|| async {
                 librqbit::Session::new(dir)
                     .await
                     .map_err(|e| format!("cannot start the BitTorrent session: {e:#}"))
             })
             .await
-            .map(Arc::clone)
+            .map(Arc::clone)?;
+
+        let kb = self.settings().bandwidth_kb;
+        let bps = if kb > 0 {
+            std::num::NonZeroU32::new((kb as u32).saturating_mul(1024))
+        } else {
+            None
+        };
+        session.ratelimits.set_download_bps(bps);
+        Ok(session)
+    }
+
+    pub fn register_torrent_handle(&self, id: &str, handle: crate::torrent::ManagedTorrentHandle) {
+        self.torrent_handles.lock().unwrap().insert(id.to_string(), handle);
+    }
+
+    pub fn unregister_torrent_handle(&self, id: &str) {
+        self.torrent_handles.lock().unwrap().remove(id);
     }
 
     pub fn rebuild_throttle(&self) {
         let kb = self.settings().bandwidth_kb;
         *self.throttle.lock().unwrap() = Throttle::new(kb);
+        if let Some(session) = self.torrent.get() {
+            let bps = if kb > 0 {
+                std::num::NonZeroU32::new((kb as u32).saturating_mul(1024))
+            } else {
+                None
+            };
+            session.ratelimits.set_download_bps(bps);
+        }
     }
 
     fn current_throttle(&self) -> Throttle {
@@ -407,6 +464,7 @@ impl AppState {
 
     pub fn views(&self) -> Vec<DownloadView> {
         let active = self.active.lock().unwrap();
+        let torrent_handles = self.torrent_handles.lock().unwrap();
         self.queue
             .lock()
             .unwrap()
@@ -428,35 +486,57 @@ impl AppState {
                     .zip(&done)
                     .filter(|&(&(start, end), &got)| start + got <= end)
                     .count();
+
+                let (torrent_downloaded, torrent_peers, torrent_peers_total) =
+                    if d.plan.engine == download::Engine::Torrent {
+                        if let Some(h) = torrent_handles.get(&d.id) {
+                            let s = h.stats();
+                            (
+                                Some(s.progress_bytes),
+                                s.live.as_ref().map(|l| l.snapshot.peer_stats.live as usize),
+                                s.live.as_ref().map(|l| l.snapshot.peer_stats.seen as usize),
+                            )
+                        } else {
+                            (None, None, None)
+                        }
+                    } else {
+                        (None, None, None)
+                    };
+
                 DownloadView {
-                id: d.id.clone(),
-                url: d.url.clone(),
-                filename: d.filename(),
-                status: d.status,
-                // A running transfer's live counters are ahead of what has
-                // been persisted, so prefer them when present.
-                downloaded: active
-                    .get(&d.id)
-                    .map(|a| a.progress.total())
-                    .unwrap_or_else(|| d.downloaded()),
-                total: d.plan.total,
-                segments: open.max(1),
-                error: d.error.clone(),
-                path: d.plan.final_path.display().to_string(),
-                added_at: d.added_at,
-                ranges,
-                done,
-                supports_ranges: d.plan.supports_ranges,
-                user_agent: d.session.as_ref().map(|s| s.user_agent.clone()),
-                referer: d.session.as_ref().and_then(|s| s.referer.clone()),
-                has_cookie: d.session.as_ref().is_some_and(|s| s.cookie.is_some()),
-                thumbnail: d.plan.thumbnail.clone(),
-                engine: match d.plan.engine {
-                    download::Engine::YtDlp => "ytdlp".into(),
-                    download::Engine::Http => "http".into(),
-                    download::Engine::Ftp => "ftp".into(),
-                    download::Engine::Torrent => "torrent".into(),
-                },
+                    id: d.id.clone(),
+                    url: d.url.clone(),
+                    filename: d.filename(),
+                    status: d.status,
+                    // A running transfer's live counters are ahead of what has
+                    // been persisted, so prefer them when present.
+                    downloaded: torrent_downloaded
+                        .or_else(|| active.get(&d.id).map(|a| a.progress.total()))
+                        .unwrap_or_else(|| d.downloaded()),
+                    total: d.plan.total,
+                    segments: if d.plan.engine == download::Engine::Torrent {
+                        torrent_peers.unwrap_or(open).max(1)
+                    } else {
+                        open.max(1)
+                    },
+                    error: d.error.clone(),
+                    path: d.plan.final_path.display().to_string(),
+                    added_at: d.added_at,
+                    ranges,
+                    done,
+                    supports_ranges: d.plan.supports_ranges,
+                    user_agent: d.session.as_ref().map(|s| s.user_agent.clone()),
+                    referer: d.session.as_ref().and_then(|s| s.referer.clone()),
+                    has_cookie: d.session.as_ref().is_some_and(|s| s.cookie.is_some()),
+                    thumbnail: d.plan.thumbnail.clone(),
+                    engine: match d.plan.engine {
+                        download::Engine::YtDlp => "ytdlp".into(),
+                        download::Engine::Http => "http".into(),
+                        download::Engine::Ftp => "ftp".into(),
+                        download::Engine::Torrent => "torrent".into(),
+                    },
+                    peers: torrent_peers,
+                    peers_total: torrent_peers_total,
                 }
             })
             .collect()
@@ -706,7 +786,7 @@ impl AppState {
             tokio::fs::create_dir_all(&dir)
                 .await
                 .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-            crate::torrent::prepare(url, &dir, custom_name)?
+            crate::torrent::prepare(url, &dir, custom_name, opts.only_files)?
         } else if crate::ftp::is_ftp_url(url) {
             crate::ftp::prepare(url, &session, &dir, categorize, custom_name).await?
         } else {
@@ -890,6 +970,7 @@ impl AppState {
         if let Some(active) = self.active.lock().unwrap().remove(id) {
             active.token.cancel();
         }
+        self.torrent_handles.lock().unwrap().remove(id);
         self.queue.lock().unwrap().retain(|d| d.id != id);
 
         if let Some(plan) = plan {
@@ -972,6 +1053,99 @@ impl AppState {
         Ok(())
     }
 
+    /// Retrieve detailed file tree, live peer stats, and tracker info for a torrent row.
+    pub async fn get_torrent_details(
+        &self,
+        app: &AppHandle,
+        id: &str,
+    ) -> Result<crate::torrent::TorrentDetailsView, String> {
+        let (plan, final_path) = {
+            let queue = self.queue.lock().unwrap();
+            let d = queue
+                .iter()
+                .find(|d| d.id == id)
+                .ok_or_else(|| format!("download not found: {id}"))?;
+            if d.plan.engine != download::Engine::Torrent {
+                return Err("download is not a torrent".into());
+            }
+            (d.plan.clone(), d.plan.final_path.clone())
+        };
+
+        if let Some(handle) = self.torrent_handles.lock().unwrap().get(id).cloned() {
+            return Ok(crate::torrent::torrent_details_from_handle(
+                &handle,
+                Some(id.to_string()),
+                Some(&final_path),
+            ));
+        }
+
+        // When not in active handles (e.g. paused or after app relaunch), inspect
+        // the source metadata and reflect any completed parts on disk.
+        let session = self.torrent_session(app).await?;
+        let mut details = crate::torrent::inspect(&session, &plan.url).await?;
+        details.id = Some(id.to_string());
+
+        if let Some(ref only) = plan.only_files {
+            for f in &mut details.files {
+                f.selected = only.contains(&f.id);
+            }
+        }
+
+        for f in &mut details.files {
+            let candidate = if final_path.is_dir() {
+                final_path.join(&f.path)
+            } else {
+                final_path.clone()
+            };
+            if candidate.exists() {
+                if let Ok(meta) = std::fs::metadata(&candidate) {
+                    let len = meta.len();
+                    f.downloaded = len;
+                    f.completed = len >= f.length && f.length > 0;
+                    f.full_path = Some(candidate.display().to_string());
+                }
+            }
+        }
+
+        Ok(details)
+    }
+
+    /// Update which files in a multi-file torrent should be fetched.
+    pub async fn set_torrent_file_selection(
+        &self,
+        app: &AppHandle,
+        id: &str,
+        only_files: Vec<usize>,
+    ) -> Result<crate::torrent::TorrentDetailsView, String> {
+        if only_files.is_empty() {
+            return Err("Must select at least one file to download".into());
+        }
+
+        {
+            let mut queue = self.queue.lock().unwrap();
+            let d = queue
+                .iter_mut()
+                .find(|d| d.id == id)
+                .ok_or_else(|| format!("download not found: {id}"))?;
+            if d.plan.engine != download::Engine::Torrent {
+                return Err("download is not a torrent".into());
+            }
+            d.plan.only_files = Some(only_files.clone());
+            self.mark_dirty();
+        }
+
+        self.save_queue();
+
+        let handle = self.torrent_handles.lock().unwrap().get(id).cloned();
+        if let Some(handle) = handle {
+            let set: std::collections::HashSet<usize> = only_files.iter().copied().collect();
+            let session = self.torrent_session(app).await?;
+            let _ = session.update_only_files(&handle, &set).await;
+        }
+
+        self.get_torrent_details(app, id).await
+    }
+
     /// Drop an entry from the list. With `delete_file`, also erase the finished
     /// file (and any leftover `.part`) from disk; otherwise the file is left in
     /// place and only the list entry goes.
@@ -984,6 +1158,7 @@ impl AppState {
         if let Some(active) = self.active.lock().unwrap().remove(id) {
             active.token.cancel();
         }
+        self.unregister_torrent_handle(id);
         self.queue.lock().unwrap().retain(|d| d.id != id);
 
         if let Some((plan, status)) = entry {
@@ -1066,7 +1241,23 @@ impl AppState {
     }
 
     pub fn clear_history(&self) {
-        self.queue.lock().unwrap().retain(|d| !d.is_terminal());
+        let removed: Vec<String> = {
+            let mut queue = self.queue.lock().unwrap();
+            let mut ids = Vec::new();
+            queue.retain(|d| {
+                if d.is_terminal() {
+                    ids.push(d.id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            ids
+        };
+        let mut handles = self.torrent_handles.lock().unwrap();
+        for id in removed {
+            handles.remove(&id);
+        }
         self.save_queue();
     }
 
@@ -1088,6 +1279,7 @@ impl AppState {
         d.error = None;
         Some(d.clone())
     }
+
 }
 
 /// Start whatever the concurrency limit allows, then emit a batched update.
@@ -1109,6 +1301,7 @@ pub fn pump(app: &AppHandle, state: &Arc<AppState>) {
 
     emit_queue(app, state);
 }
+
 
 fn spawn_transfer(app: AppHandle, state: Arc<AppState>, entry: Download) {
     let id = entry.id.clone();
@@ -1280,7 +1473,7 @@ async fn run_http(
         move |downloaded, total| {
             let _ = emitter.emit(
                 "download://progress",
-                ProgressRow { id: row_id.clone(), downloaded, total },
+                ProgressRow::simple(row_id.clone(), downloaded, total),
             );
         },
     )
@@ -1332,23 +1525,37 @@ async fn run_torrent(
     let name_state = Arc::clone(state);
     let name_id = id.to_string();
 
+    let handle_state = Arc::clone(state);
+    let handle_id = id.to_string();
+
     let result = crate::torrent::run(
         &session,
         plan,
         progress,
         token,
-        move |downloaded, total| {
+        move |downloaded, total, peers, peers_total, upload_speed, uploaded| {
             if let Some(total) = total {
                 size_state.set_total(&size_id, total);
             }
             let _ = emitter.emit(
                 "download://progress",
-                ProgressRow { id: row_id.clone(), downloaded, total },
+                ProgressRow {
+                    id: row_id.clone(),
+                    downloaded,
+                    total,
+                    peers,
+                    peers_total,
+                    upload_speed,
+                    uploaded,
+                },
             );
         },
         move |name| {
             name_state.set_display_name(&name_id, name);
             emit_queue(&name_app, &name_state);
+        },
+        move |handle| {
+            handle_state.register_torrent_handle(&handle_id, handle);
         },
     )
     .await;
@@ -1404,7 +1611,7 @@ async fn run_ftp(
         move |downloaded, total| {
             let _ = emitter.emit(
                 "download://progress",
-                ProgressRow { id: row_id.clone(), downloaded, total },
+                ProgressRow::simple(row_id.clone(), downloaded, total),
             );
         },
     )
@@ -1525,7 +1732,7 @@ async fn run_video(
             }
             let _ = emitter.emit(
                 "download://progress",
-                ProgressRow { id: row_id.clone(), downloaded, total },
+                ProgressRow::simple(row_id.clone(), downloaded, total),
             );
         },
         on_file,
@@ -1723,6 +1930,7 @@ mod tests {
             ranges: vec![(0, 999)],
             engine: crate::download::Engine::Http,
             thumbnail: None,
+            only_files: None,
         };
         state.queue.lock().unwrap().push(Download::new(id.into(), plan));
     }
@@ -1744,6 +1952,7 @@ mod tests {
             ranges: vec![(0, 999)],
             engine: crate::download::Engine::Http,
             thumbnail: None,
+            only_files: None,
         }
     }
 
@@ -2342,6 +2551,7 @@ mod tests {
             ranges: vec![(0, 3)],
             engine: crate::download::Engine::Http,
             thumbnail: None,
+            only_files: None,
         };
         std::fs::write(&plan.part_path, b"abcd").unwrap();
         state.queue.lock().unwrap().push(Download::new("r1".into(), plan.clone()));
@@ -2426,6 +2636,7 @@ mod tests {
         assert_ne!(c.id, b.id);
         assert!(state.claim_next(2).is_none());
     }
+
 
     /// A repeated claim of a single entry (what two racing pumps would attempt)
     /// yields it exactly once.
@@ -2526,6 +2737,7 @@ mod tests {
             ranges: vec![],
             engine: crate::download::Engine::Http,
             thumbnail: None,
+            only_files: None,
         };
         state.queue.lock().unwrap().push(Download::new("k".into(), plan));
 
@@ -2549,6 +2761,7 @@ mod tests {
             ranges: vec![],
             engine: crate::download::Engine::Http,
             thumbnail: None,
+            only_files: None,
         };
         state.queue.lock().unwrap().push(Download::new("k2".into(), plan2));
         state.remove("k2", true);

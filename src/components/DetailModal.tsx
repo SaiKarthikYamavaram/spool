@@ -1,8 +1,10 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Check, Copy, ExternalLink, Folder, ShieldCheck, X } from "lucide-react";
 import { toast } from "sonner";
-import { api, formatBytes, formatDate, type DownloadView } from "../lib/api";
+import { cn } from "cn";
+import { api, formatBytes, formatDate, type DownloadView, type TorrentDetailsView } from "../lib/api";
 import { Button } from "./ui/button";
+import { Checkbox } from "./ui/checkbox";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "./ui/dialog";
 import { Input } from "./ui/input";
 import { Progress } from "./ui/progress";
@@ -27,10 +29,25 @@ export function DetailModal({
   const total = row.total ?? liveTotal ?? null;
   const percent = total ? Math.min(100, (downloaded / total) * 100) : null;
   const [actionError, setActionError] = useState<string | null>(null);
+  const [torrentDetails, setTorrentDetails] = useState<TorrentDetailsView | null>(null);
+
+  const fetchTorrentDetails = useCallback(() => {
+    if (row.engine !== "torrent") return;
+    api.getTorrentDetails(row.id).then(setTorrentDetails).catch(() => {});
+  }, [row.id, row.engine]);
+
+  useEffect(() => {
+    if (row.engine !== "torrent") return;
+    fetchTorrentDetails();
+    if (row.status === "downloading") {
+      const interval = setInterval(fetchTorrentDetails, 2000);
+      return () => clearInterval(interval);
+    }
+  }, [row.engine, row.status, fetchTorrentDetails]);
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-h-[88vh] overflow-y-auto w-[calc(100vw-2rem)] sm:max-w-lg p-4 sm:p-6">
+      <DialogContent className={cn("max-h-[88vh] overflow-y-auto w-[calc(100vw-2rem)] p-4 sm:p-6", row.engine === "torrent" ? "sm:max-w-xl" : "sm:max-w-lg")}>
         <DialogHeader>
           <DialogTitle className="truncate text-base sm:text-lg" title={row.filename}>{row.filename}</DialogTitle>
         </DialogHeader>
@@ -68,7 +85,9 @@ export function DetailModal({
                 : row.engine === "ftp"
                 ? "1 (FTP, resumed with REST)"
                 : row.engine === "torrent"
-                ? "BitTorrent swarm"
+                ? torrentDetails
+                  ? `${torrentDetails.peers_connected} connected (${torrentDetails.peers_total} seen in swarm)`
+                  : "BitTorrent swarm"
                 : row.supports_ranges
                   ? `${row.segments} (server supports byte ranges)`
                   : "1 (server has no range support)"
@@ -89,7 +108,15 @@ export function DetailModal({
           {row.error && <Field label="Error" value={row.error} error />}
         </dl>
 
-        {row.ranges.length > 1 && (
+        {row.engine === "torrent" && torrentDetails && (
+          <TorrentSection
+            row={row}
+            details={torrentDetails}
+            onRefresh={fetchTorrentDetails}
+          />
+        )}
+
+        {row.engine !== "torrent" && row.ranges.length > 1 && (
           <div className="space-y-2">
             <h3 className="text-sm font-medium">Segments</h3>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
@@ -215,7 +242,7 @@ function Checksum({ id }: { id: string }) {
                   .catch((e) => toast.error(String(e)));
               }}
             >
-              <Copy />
+              <Copy className="size-3" />
             </Button>
           </div>
           <Input
@@ -270,3 +297,233 @@ function Field({
 }
 
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+
+function TorrentSection({
+  row,
+  details,
+  onRefresh,
+}: {
+  row: DownloadView;
+  details: TorrentDetailsView;
+  onRefresh: () => void;
+}) {
+  const [showTrackers, setShowTrackers] = useState(false);
+  const [updating, setUpdating] = useState(false);
+
+  async function handleToggleFile(fileId: number, selected: boolean) {
+    if (updating) return;
+    const current = details.files.filter((f) => f.selected).map((f) => f.id);
+    let next: number[];
+    if (selected) {
+      next = [...current, fileId];
+    } else {
+      next = current.filter((id) => id !== fileId);
+    }
+    if (next.length === 0) {
+      toast.error("At least one file must remain selected");
+      return;
+    }
+    setUpdating(true);
+    try {
+      await api.setTorrentFileSelection(row.id, next);
+      toast.success("File selection updated");
+      onRefresh();
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setUpdating(false);
+    }
+  }
+
+  async function handleSelectAll(selectAll: boolean) {
+    if (updating) return;
+    const next = selectAll ? details.files.map((f) => f.id) : [details.files[0].id];
+    setUpdating(true);
+    try {
+      await api.setTorrentFileSelection(row.id, next);
+      toast.success(selectAll ? "All files selected" : "File selection cleared");
+      onRefresh();
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setUpdating(false);
+    }
+  }
+
+  const selectedCount = details.files.filter((f) => f.selected).length;
+
+  return (
+    <div className="space-y-4 pt-1">
+      {/* Telemetry stats cards */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+        <div className="rounded-md border border-border/60 bg-muted/30 p-2">
+          <span className="text-muted-foreground block text-[11px]">Swarm Peers</span>
+          <span className="font-medium font-mono">
+            {details.peers_connected} / {details.peers_total}
+          </span>
+        </div>
+        <div className="rounded-md border border-border/60 bg-muted/30 p-2">
+          <span className="text-muted-foreground block text-[11px]">Upload Speed</span>
+          <span className="font-medium font-mono">
+            {formatBytes(details.upload_speed)}/s
+          </span>
+        </div>
+        <div className="rounded-md border border-border/60 bg-muted/30 p-2">
+          <span className="text-muted-foreground block text-[11px]">Uploaded</span>
+          <span className="font-medium font-mono">
+            {formatBytes(details.uploaded_bytes)}
+          </span>
+        </div>
+        <div className="rounded-md border border-border/60 bg-muted/30 p-2">
+          <span className="text-muted-foreground block text-[11px]">Share Ratio</span>
+          <span className="font-medium font-mono">
+            {details.downloaded_bytes > 0
+              ? (details.uploaded_bytes / details.downloaded_bytes).toFixed(2)
+              : "0.00"}
+          </span>
+        </div>
+      </div>
+
+      {/* Torrent metadata */}
+      <div className="rounded-md border border-border/60 bg-muted/20 p-2.5 text-xs space-y-1.5 font-mono">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-muted-foreground shrink-0">BTIH Info Hash</span>
+          <div className="flex items-center gap-1 min-w-0">
+            <span className="truncate select-all text-[11px]">{details.info_hash}</span>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              title="Copy Info Hash"
+              onClick={() => {
+                navigator.clipboard.writeText(details.info_hash);
+                toast.success("Info hash copied");
+              }}
+            >
+              <Copy className="size-3" />
+            </Button>
+          </div>
+        </div>
+        <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+          <span>Pieces</span>
+          <span>
+            {details.pieces_count.toLocaleString()} pieces × {formatBytes(details.piece_length)}
+          </span>
+        </div>
+      </div>
+
+      {/* Trackers list */}
+      {details.trackers.length > 0 && (
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between text-xs">
+            <span className="font-medium">Trackers ({details.trackers.length})</span>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 px-2 text-[11px]"
+              onClick={() => setShowTrackers(!showTrackers)}
+            >
+              {showTrackers ? "Hide" : "Show"}
+            </Button>
+          </div>
+          {showTrackers && (
+            <div className="max-h-28 overflow-y-auto rounded border border-border/60 bg-background/50 p-2 text-[11px] font-mono divide-y divide-border/30">
+              {details.trackers.map((tr, i) => (
+                <div key={i} className="py-1 truncate" title={tr}>
+                  {tr}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Files Manager table */}
+      <div className="space-y-2">
+        <div className="flex items-center justify-between text-xs">
+          <span className="font-medium">
+            Files ({selectedCount} of {details.files.length} selected)
+          </span>
+          {row.status !== "completed" && details.files.length > 1 && (
+            <div className="flex items-center gap-1.5">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 px-2 text-[11px]"
+                disabled={updating}
+                onClick={() => handleSelectAll(true)}
+              >
+                Select all
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 px-2 text-[11px]"
+                disabled={updating}
+                onClick={() => handleSelectAll(false)}
+              >
+                Deselect others
+              </Button>
+            </div>
+          )}
+        </div>
+
+        <div className="max-h-56 overflow-y-auto rounded border border-border/60 divide-y divide-border/40 bg-background/50 text-xs">
+          {details.files.map((f) => {
+            const pct = f.length > 0 ? Math.min(100, (f.downloaded / f.length) * 100) : 100;
+
+            return (
+              <div key={f.id} className="p-2 space-y-1 hover:bg-muted/30">
+                <div className="flex items-center gap-2">
+                  {row.status !== "completed" ? (
+                    <Checkbox
+                      checked={f.selected}
+                      disabled={updating}
+                      onCheckedChange={(checked) => handleToggleFile(f.id, checked === true)}
+                    />
+                  ) : (
+                    <Check className="size-3.5 text-emerald-500 shrink-0" />
+                  )}
+                  <span className="font-mono text-[11px] truncate flex-1 min-w-0" title={f.path}>
+                    {f.path}
+                  </span>
+                  <span className="font-mono text-[11px] text-muted-foreground shrink-0 tabular-nums">
+                    {formatBytes(f.length)}
+                  </span>
+                  {f.full_path && (
+                    <div className="flex items-center gap-0.5 shrink-0 ml-1">
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        title="Open file"
+                        onClick={() => api.openFile(f.full_path!)}
+                      >
+                        <ExternalLink className="size-3" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        title="Show in folder"
+                        onClick={() => api.revealFile(f.full_path!)}
+                      >
+                        <Folder className="size-3" />
+                      </Button>
+                    </div>
+                  )}
+                </div>
+
+                {f.selected && row.status !== "completed" && (
+                  <div className="flex items-center gap-2 pl-6">
+                    <Progress value={pct} className="h-1 flex-1" />
+                    <span className="font-mono text-[10px] text-muted-foreground tabular-nums shrink-0">
+                      {pct.toFixed(0)}%
+                    </span>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}

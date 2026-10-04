@@ -170,6 +170,7 @@ fn resume_download(app: AppHandle, state: Shared<'_>, id: String) {
     state::pump(&app, &state);
 }
 
+
 #[tauri::command]
 fn cancel_download(app: AppHandle, state: Shared<'_>, id: String) {
     state.cancel(&id);
@@ -197,6 +198,35 @@ async fn redownload(app: AppHandle, state: Shared<'_>, id: String) -> Result<(),
 fn remove_download(app: AppHandle, state: Shared<'_>, id: String, delete_file: bool) {
     state.remove(&id, delete_file);
     state::emit_queue(&app, &state);
+}
+
+#[tauri::command]
+async fn inspect_torrent(
+    app: AppHandle,
+    state: Shared<'_>,
+    url: String,
+) -> Result<crate::torrent::TorrentDetailsView, String> {
+    let session = state.torrent_session(&app).await?;
+    crate::torrent::inspect(&session, &url).await
+}
+
+#[tauri::command]
+async fn get_torrent_details(
+    app: AppHandle,
+    state: Shared<'_>,
+    id: String,
+) -> Result<crate::torrent::TorrentDetailsView, String> {
+    state.get_torrent_details(&app, &id).await
+}
+
+#[tauri::command]
+async fn set_torrent_file_selection(
+    app: AppHandle,
+    state: Shared<'_>,
+    id: String,
+    only_files: Vec<usize>,
+) -> Result<crate::torrent::TorrentDetailsView, String> {
+    state.set_torrent_file_selection(&app, &id, only_files).await
 }
 
 #[tauri::command]
@@ -1043,6 +1073,9 @@ pub fn run() {
             get_extension_status,
             open_browser_extensions,
             reveal_extension_dir,
+            inspect_torrent,
+            get_torrent_details,
+            set_torrent_file_selection,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -29,6 +29,8 @@ export type DownloadView = {
   has_cookie: boolean;
   thumbnail: string | null;
   engine: string;
+  peers?: number | null;
+  peers_total?: number | null;
 };
 
 export type Settings = {
@@ -67,6 +69,36 @@ export type ProgressRow = {
   id: string;
   downloaded: number;
   total: number | null;
+  peers?: number | null;
+  peers_total?: number | null;
+  upload_speed?: number | null;
+  uploaded?: number | null;
+};
+
+export type TorrentFileView = {
+  id: number;
+  path: string;
+  length: number;
+  downloaded: number;
+  selected: boolean;
+  full_path?: string | null;
+  completed: boolean;
+};
+
+export type TorrentDetailsView = {
+  id?: string | null;
+  name: string;
+  info_hash: string;
+  total_bytes: number;
+  piece_length: number;
+  pieces_count: number;
+  files: TorrentFileView[];
+  trackers: string[];
+  peers_connected: number;
+  peers_total: number;
+  upload_speed: number;
+  downloaded_bytes: number;
+  uploaded_bytes: number;
 };
 
 export type ExtensionStatus = {
@@ -84,6 +116,7 @@ export type AddOptions = {
   name?: string | null;
   quality?: string | null;
   start?: boolean;
+  only_files?: number[] | null;
 };
 
 export const api = {
@@ -160,6 +193,11 @@ export const api = {
   // Open the containing folder with the file selected, like IDM's
   // "Open containing folder".
   revealFile: (path: string) => revealItemInDir(path),
+  /// BitTorrent inspection and management
+  inspectTorrent: (url: string) => invoke<TorrentDetailsView>("inspect_torrent", { url }),
+  getTorrentDetails: (id: string) => invoke<TorrentDetailsView>("get_torrent_details", { id }),
+  setTorrentFileSelection: (id: string, onlyFiles: number[]) =>
+    invoke<TorrentDetailsView>("set_torrent_file_selection", { id, onlyFiles }),
 };
 
 export function formatBytes(n: number): string {

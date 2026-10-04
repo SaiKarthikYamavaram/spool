@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isStreamManifest, isVideoUrl, suggestedName } from "./AddDialog";
+import { isStreamManifest, isTorrentUrl, isVideoUrl, suggestedName } from "./AddDialog";
 
 describe("isVideoUrl", () => {
   // Decides only whether the quality picker is offered, so drift with the
@@ -92,5 +92,27 @@ describe("suggestedName", () => {
       suggestedName("magnet:?xt=urn:btih:abc&dn=My%20Cool%20File.iso"),
     ).toBe("My Cool File.iso");
     expect(suggestedName("magnet:?xt=urn:btih:abc")).toBe("torrent");
+  });
+});
+
+describe("isTorrentUrl", () => {
+  it("recognizes magnet links", () => {
+    expect(isTorrentUrl("magnet:?xt=urn:btih:abc123def456")).toBe(true);
+    expect(isTorrentUrl("MAGNET:?XT=URN:BTIH:ABC123DEF456")).toBe(true);
+  });
+
+  it("recognizes file:// .torrent paths", () => {
+    expect(isTorrentUrl("file:///home/user/downloads/archive.torrent")).toBe(true);
+    expect(isTorrentUrl("file://C:/Users/user/downloads/archive.TORRENT")).toBe(true);
+  });
+
+  it("recognizes http/https .torrent URLs", () => {
+    expect(isTorrentUrl("https://releases.ubuntu.com/22.04/ubuntu-22.04-desktop-amd64.iso.torrent")).toBe(true);
+  });
+
+  it("rejects regular URLs and files", () => {
+    expect(isTorrentUrl("https://example.com/file.zip")).toBe(false);
+    expect(isTorrentUrl("https://example.com/movie.mp4")).toBe(false);
+    expect(isTorrentUrl("not a url")).toBe(false);
   });
 });

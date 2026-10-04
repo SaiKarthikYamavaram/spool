@@ -232,6 +232,7 @@ mod tests {
             ranges: vec![(0, 99), (100, 199), (200, 299)],
             engine: crate::download::Engine::Http,
             thumbnail: None,
+            only_files: None,
         };
         let d = Download::new("1".into(), plan);
         assert_eq!(d.done.len(), 3, "one counter per segment");
@@ -251,6 +252,7 @@ mod tests {
             ranges: Vec::new(),
             engine: crate::download::Engine::YtDlp,
             thumbnail: None,
+            only_files: None,
         };
         assert_eq!(Download::new("2".into(), video).done.len(), 1);
     }
@@ -275,6 +277,7 @@ mod tests {
                 ranges: Vec::new(),
                 engine: crate::download::Engine::Http,
                 thumbnail: None,
+                only_files: None,
             };
             let mut d = Download::new("1".into(), plan);
             d.status = status;

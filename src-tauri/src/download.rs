@@ -1077,7 +1077,7 @@ pub enum Engine {
 ///
 /// Persisted in `queue.json` so a resume after a restart reproduces the exact
 /// same layout instead of re-probing and possibly choosing differently.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DownloadPlan {
     pub url: String,
     pub final_path: PathBuf,
@@ -1091,6 +1091,9 @@ pub struct DownloadPlan {
     /// Remote thumbnail URL for a preview (video downloads). `None` for files.
     #[serde(default)]
     pub thumbnail: Option<String>,
+    /// BitTorrent file selection: list of file indices to download. None means all files.
+    #[serde(default)]
+    pub only_files: Option<Vec<usize>>,
 }
 
 impl DownloadPlan {
@@ -1134,6 +1137,7 @@ pub fn video_plan(
         ranges: Vec::new(),
         engine: Engine::YtDlp,
         thumbnail,
+        only_files: None,
     })
 }
 
@@ -1225,6 +1229,7 @@ pub async fn prepare(
         ranges,
         engine: Engine::Http,
         thumbnail: None,
+        only_files: None,
     })
 }
 

@@ -11,15 +11,51 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use librqbit::{AddTorrent, AddTorrentOptions, Session, TorrentStatsState};
+pub type ManagedTorrentHandle = Arc<librqbit::ManagedTorrent>;
+use librqbit::{
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, Session,
+    TorrentStatsState,
+};
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::download::{self, DownloadPlan, Engine, Progress};
 
 /// How often the transfer's counters are read. Pieces land continuously, so
 /// this is a display cadence, not a transfer one.
-const POLL: std::time::Duration = std::time::Duration::from_millis(1000);
+const POLL: Duration = Duration::from_millis(1000);
+
+/// One file entry inside a multi-file or single-file torrent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TorrentFileView {
+    pub id: usize,
+    pub path: String,
+    pub length: u64,
+    pub downloaded: u64,
+    pub selected: bool,
+    pub full_path: Option<String>,
+    pub completed: bool,
+}
+
+/// Comprehensive inspection and live swarm telemetry for a torrent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TorrentDetailsView {
+    pub id: Option<String>,
+    pub name: String,
+    pub info_hash: String,
+    pub total_bytes: u64,
+    pub piece_length: u32,
+    pub pieces_count: usize,
+    pub files: Vec<TorrentFileView>,
+    pub trackers: Vec<String>,
+    pub peers_connected: usize,
+    pub peers_total: usize,
+    pub upload_speed: u64,
+    pub downloaded_bytes: u64,
+    pub uploaded_bytes: u64,
+}
 
 /// A `.torrent` file on disk, written as a plain absolute path or as a
 /// `file://` URL — which is how a desktop entry's `%U` hands a file over.
@@ -95,13 +131,37 @@ pub fn suggested_name(raw: &str) -> String {
         .unwrap_or_else(|| "torrent".to_string())
 }
 
+/// Extract tracker announce URLs from a magnet link or .torrent path.
+pub fn extract_trackers(raw: &str) -> Vec<String> {
+    let mut trackers = Vec::new();
+    let raw = raw.trim();
+    if raw.to_ascii_lowercase().starts_with("magnet:") {
+        if let Some((_, query)) = raw.split_once('?') {
+            for field in query.split('&') {
+                if let Some(value) = field.strip_prefix("tr=") {
+                    let decoded = download::percent_decode(&value.replace('+', " "));
+                    if !trackers.contains(&decoded) {
+                        trackers.push(decoded);
+                    }
+                }
+            }
+        }
+    }
+    trackers
+}
+
 /// Build a plan without touching the network.
 ///
 /// Nothing is known yet for a magnet link — not the size, not the real name,
 /// not even how many files there are — so the plan carries a placeholder and
 /// the run fills both in once the metadata arrives. This is the same shape the
 /// yt-dlp engine uses for the same reason.
-pub fn prepare(url: &str, dest_dir: &Path, custom_name: Option<&str>) -> Result<DownloadPlan, String> {
+pub fn prepare(
+    url: &str,
+    dest_dir: &Path,
+    custom_name: Option<&str>,
+    only_files: Option<Vec<usize>>,
+) -> Result<DownloadPlan, String> {
     if !is_torrent_url(url) {
         return Err(format!("not a torrent: {url}"));
     }
@@ -127,7 +187,207 @@ pub fn prepare(url: &str, dest_dir: &Path, custom_name: Option<&str>) -> Result<
         ranges: Vec::new(),
         engine: Engine::Torrent,
         thumbnail: None,
+        only_files,
     })
+}
+
+/// Construct a `TorrentDetailsView` from a live or paused `ManagedTorrentHandle`.
+pub fn torrent_details_from_handle(
+    handle: &ManagedTorrentHandle,
+    id: Option<String>,
+    final_path: Option<&Path>,
+) -> TorrentDetailsView {
+    let stats = handle.stats();
+    let info_hash = handle.info_hash().as_string();
+    let name = handle.name().unwrap_or_else(|| "torrent".to_string());
+    let mut trackers: Vec<String> = handle
+        .shared
+        .trackers
+        .iter()
+        .map(|u| u.to_string())
+        .collect();
+    trackers.sort();
+
+    let (peers_connected, peers_total, upload_speed) = match &stats.live {
+        Some(l) => (
+            l.snapshot.peer_stats.live as usize,
+            l.snapshot.peer_stats.seen as usize,
+            l.upload_speed.as_bytes(),
+        ),
+        None => (0, 0, 0),
+    };
+
+    let only_set = handle.only_files();
+
+    let (total_bytes, piece_length, pieces_count, files) = handle
+        .with_metadata(|meta| {
+            let piece_len = meta.lengths().default_piece_length();
+            let piece_cnt = meta.lengths().total_pieces() as usize;
+            let tot = meta.lengths().total_length();
+            let mut files_vec = Vec::new();
+            for (i, fi) in meta.file_infos.iter().enumerate() {
+                let rel = fi.relative_filename.display().to_string();
+                let len = fi.len;
+                let done = stats.file_progress.get(i).copied().unwrap_or(0);
+                let selected = only_set.as_ref().map_or(true, |s| s.contains(&i));
+
+                let candidate1 = final_path.map(|p| {
+                    if p.is_dir() {
+                        p.join(&fi.relative_filename)
+                    } else {
+                        p.to_path_buf()
+                    }
+                });
+                let candidate2 = handle.output_folder().join(&fi.relative_filename);
+
+                let full_path_buf = candidate1
+                    .filter(|p| p.exists())
+                    .or_else(|| if candidate2.exists() { Some(candidate2) } else { None });
+
+                let is_completed = (done >= len && len > 0) || full_path_buf.is_some();
+                let full_path_str = full_path_buf.map(|p| p.display().to_string());
+
+                files_vec.push(TorrentFileView {
+                    id: i,
+                    path: rel,
+                    length: len,
+                    downloaded: done,
+                    selected,
+                    full_path: full_path_str,
+                    completed: is_completed,
+                });
+            }
+            (tot, piece_len, piece_cnt, files_vec)
+        })
+        .unwrap_or_else(|_| (stats.total_bytes, 0, 0, Vec::new()));
+
+    TorrentDetailsView {
+        id,
+        name,
+        info_hash,
+        total_bytes,
+        piece_length,
+        pieces_count,
+        files,
+        trackers,
+        peers_connected,
+        peers_total,
+        upload_speed,
+        downloaded_bytes: stats.progress_bytes,
+        uploaded_bytes: stats.uploaded_bytes,
+    }
+}
+
+/// Inspect a torrent file or magnet link without starting a transfer.
+///
+/// Fetches metainfo (files, sizes, piece count, info hash, and announce trackers)
+/// so the user can inspect content or select which files to download up front.
+pub async fn inspect(session: &Arc<Session>, url: &str) -> Result<TorrentDetailsView, String> {
+    if !is_torrent_url(url) {
+        return Err(format!("not a torrent: {url}"));
+    }
+
+    let source = match local_path(url) {
+        Some(path) => {
+            if !path.is_file() {
+                return Err(format!("no such file: {}", path.display()));
+            }
+            let bytes = tokio::fs::read(&path)
+                .await
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            AddTorrent::from_bytes(bytes)
+        }
+        None => AddTorrent::from_url(url.trim().to_string()),
+    };
+
+    let timeout_dur = if url.trim().to_ascii_lowercase().starts_with("magnet:") {
+        Duration::from_secs(12)
+    } else {
+        Duration::from_secs(6)
+    };
+
+    let options = AddTorrentOptions {
+        list_only: true,
+        ..Default::default()
+    };
+
+    let response = match tokio::time::timeout(timeout_dur, session.add_torrent(source, Some(options))).await {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => return Err(format!("cannot inspect torrent: {e:#}")),
+        Err(_) => {
+            return Err("Timed out resolving torrent metadata from swarm. You can still add the torrent directly.".to_string())
+        }
+    };
+
+    match response {
+        AddTorrentResponse::ListOnly(list) => {
+            let info_hash = list.info_hash.as_string();
+            let name = list
+                .info
+                .name()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| suggested_name(url));
+            let piece_length = list.info.lengths().default_piece_length();
+            let pieces_count = list.info.lengths().total_pieces() as usize;
+            let total_bytes = list.info.lengths().total_length();
+
+            let mut files = Vec::new();
+            let only_set = list.only_files.as_ref();
+            for (i, fd) in list.info.iter_file_details().enumerate() {
+                let rel = fd.filename.to_pathbuf().display().to_string();
+                let len = fd.len;
+                let selected = only_set.map_or(true, |s| s.contains(&i));
+                files.push(TorrentFileView {
+                    id: i,
+                    path: rel,
+                    length: len,
+                    downloaded: 0,
+                    selected,
+                    full_path: None,
+                    completed: false,
+                });
+            }
+
+            let mut trackers = extract_trackers(url);
+            if trackers.is_empty() && !list.torrent_bytes.is_empty() {
+                if let Ok(meta) = librqbit::torrent_from_bytes(&list.torrent_bytes) {
+                    if let Some(ann) = meta.announce {
+                        let a = String::from_utf8_lossy(ann.as_ref()).to_string();
+                        if !trackers.contains(&a) {
+                            trackers.push(a);
+                        }
+                    }
+                    for group in meta.announce_list {
+                        for tr in group {
+                            let s = String::from_utf8_lossy(tr.as_ref()).to_string();
+                            if !trackers.contains(&s) {
+                                trackers.push(s);
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(TorrentDetailsView {
+                id: None,
+                name,
+                info_hash,
+                total_bytes,
+                piece_length,
+                pieces_count,
+                files,
+                trackers,
+                peers_connected: list.seen_peers.len(),
+                peers_total: list.seen_peers.len(),
+                upload_speed: 0,
+                downloaded_bytes: 0,
+                uploaded_bytes: 0,
+            })
+        }
+        AddTorrentResponse::AlreadyManaged(_, handle) | AddTorrentResponse::Added(_, handle) => {
+            Ok(torrent_details_from_handle(&handle, None, None))
+        }
+    }
 }
 
 /// Run or resume a torrent.
@@ -135,17 +395,19 @@ pub fn prepare(url: &str, dest_dir: &Path, custom_name: Option<&str>) -> Result<
 /// Resume needs no special handling: librqbit rechecks what is already in the
 /// output folder and asks peers only for the pieces still missing — which is
 /// why `overwrite` has to be set, since the files are already there.
-pub async fn run<F, G>(
+pub async fn run<F, G, H>(
     session: &Arc<Session>,
     plan: &DownloadPlan,
     progress: &Progress,
     token: CancellationToken,
     on_progress: F,
     on_name: G,
+    on_handle: H,
 ) -> Result<PathBuf, String>
 where
-    F: Fn(u64, Option<u64>) + Send + Sync + 'static,
+    F: Fn(u64, Option<u64>, Option<usize>, Option<usize>, Option<u64>, Option<u64>) + Send + Sync + 'static,
     G: Fn(&str) + Send + Sync + 'static,
+    H: Fn(ManagedTorrentHandle) + Send + Sync + 'static,
 {
     let output_folder = plan
         .final_path
@@ -158,6 +420,7 @@ where
         // Required for resume: the files from the previous run are already on
         // disk, and without this librqbit refuses to write over them.
         overwrite: true,
+        only_files: plan.only_files.clone(),
         ..Default::default()
     };
 
@@ -178,6 +441,8 @@ where
     let handle = response
         .into_handle()
         .ok_or_else(|| "that torrent produced no transfer".to_string())?;
+
+    on_handle(handle.clone());
 
     // The real name, once the metadata is in. For a magnet that is the first
     // moment the row can stop saying "torrent".
@@ -213,7 +478,22 @@ where
 
         progress.set_absolute(stats.progress_bytes);
         let total = (stats.total_bytes > 0).then_some(stats.total_bytes);
-        on_progress(stats.progress_bytes, total);
+        let (peers, peers_total, up_speed) = match &stats.live {
+            Some(l) => (
+                Some(l.snapshot.peer_stats.live as usize),
+                Some(l.snapshot.peer_stats.seen as usize),
+                Some(l.upload_speed.as_bytes()),
+            ),
+            None => (None, None, None),
+        };
+        on_progress(
+            stats.progress_bytes,
+            total,
+            peers,
+            peers_total,
+            up_speed,
+            Some(stats.uploaded_bytes),
+        );
 
         if stats.finished {
             break;
@@ -286,7 +566,7 @@ mod tests {
 
     #[test]
     fn a_plan_carries_the_provisional_name() {
-        let plan = prepare("magnet:?xt=urn:btih:abc&dn=Thing", Path::new("/tmp/dl"), None).unwrap();
+        let plan = prepare("magnet:?xt=urn:btih:abc&dn=Thing", Path::new("/tmp/dl"), None, None).unwrap();
         assert_eq!(plan.engine, Engine::Torrent);
         assert_eq!(plan.final_path, Path::new("/tmp/dl/Thing"));
         assert!(plan.total.is_none(), "a magnet knows no size until metadata arrives");
@@ -294,15 +574,21 @@ mod tests {
     }
 
     #[test]
+    fn a_plan_carries_file_selection() {
+        let plan = prepare("magnet:?xt=urn:btih:abc&dn=Thing", Path::new("/tmp/dl"), None, Some(vec![1, 3])).unwrap();
+        assert_eq!(plan.only_files, Some(vec![1, 3]));
+    }
+
+    #[test]
     fn a_typed_name_wins_over_the_magnet() {
         let plan =
-            prepare("magnet:?xt=urn:btih:abc&dn=Thing", Path::new("/tmp/dl"), Some("mine")).unwrap();
+            prepare("magnet:?xt=urn:btih:abc&dn=Thing", Path::new("/tmp/dl"), Some("mine"), None).unwrap();
         assert_eq!(plan.final_path, Path::new("/tmp/dl/mine"));
     }
 
     #[test]
     fn a_non_torrent_is_refused() {
-        assert!(prepare("https://example.com/a.zip", Path::new("/tmp"), None).is_err());
+        assert!(prepare("https://example.com/a.zip", Path::new("/tmp"), None, None).is_err());
     }
 
     #[test]
@@ -323,7 +609,7 @@ mod tests {
         std::fs::write(&file, b"d4:infoe").unwrap();
         let url = reqwest::Url::from_file_path(&file).unwrap().to_string();
 
-        let plan = prepare(&url, Path::new("/tmp/dl"), None).unwrap();
+        let plan = prepare(&url, Path::new("/tmp/dl"), None, None).unwrap();
         assert_eq!(plan.url, file.display().to_string());
         assert_eq!(plan.final_path, Path::new("/tmp/dl/My Distro"));
         std::fs::remove_dir_all(&dir).unwrap();
@@ -331,6 +617,15 @@ mod tests {
 
     #[test]
     fn a_missing_torrent_file_is_refused_up_front() {
-        assert!(prepare("/nonexistent/spool/x.torrent", Path::new("/tmp"), None).is_err());
+        assert!(prepare("/nonexistent/spool/x.torrent", Path::new("/tmp"), None, None).is_err());
+    }
+
+    #[test]
+    fn magnet_trackers_are_extracted() {
+        let url = "magnet:?xt=urn:btih:abc&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&tr=http%3A%2F%2Ftracker.example.com%2Fannounce";
+        let trackers = extract_trackers(url);
+        assert_eq!(trackers.len(), 2);
+        assert_eq!(trackers[0], "udp://tracker.opentrackr.org:1337/announce");
+        assert_eq!(trackers[1], "http://tracker.example.com/announce");
     }
 }

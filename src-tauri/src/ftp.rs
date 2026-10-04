@@ -157,6 +157,7 @@ pub async fn prepare(
         ranges: Vec::new(),
         engine: Engine::Ftp,
         thumbnail: None,
+        only_files: None,
     })
 }
 

@@ -153,6 +153,7 @@ function App() {
   // Live total from progress events — for yt-dlp the size is only known once
   // the transfer is running, so the queue snapshot's total is null until then.
   const liveTotal = useRef(new Map<string, number>());
+  const livePeers = useRef(new Map<string, { peers: number | null; peers_total: number | null }>());
   const samples = useRef(new Map<string, Sample>());
   const [, forceRender] = useState(0);
   // Progress events arrive far faster than the display can paint. Firing a
@@ -225,7 +226,7 @@ function App() {
       // Drop per-download tracking for rows that no longer exist, or these maps
       // grow for the life of the session.
       const alive = new Set(e.payload.map((r) => r.id));
-      for (const map of [live.current, liveTotal.current, samples.current]) {
+      for (const map of [live.current, liveTotal.current, samples.current, livePeers.current]) {
         for (const id of map.keys()) if (!alive.has(id)) map.delete(id);
       }
     });
@@ -240,9 +241,12 @@ function App() {
       setPendingUrl(e.payload.url);
     });
     const unlistenProgress = listen<ProgressRow>("download://progress", (event) => {
-      const { id, downloaded, total } = event.payload;
+      const { id, downloaded, total, peers, peers_total } = event.payload;
       live.current.set(id, downloaded);
       if (total) liveTotal.current.set(id, total);
+      if (peers !== undefined && peers !== null) {
+        livePeers.current.set(id, { peers, peers_total: peers_total ?? null });
+      }
       const now = performance.now();
       const prev = samples.current.get(id);
       let speed = prev?.speed ?? 0;
@@ -733,6 +737,7 @@ function App() {
                   row={row}
                   liveBytes={live.current.get(row.id)}
                   liveTotal={liveTotal.current.get(row.id)}
+                  livePeers={livePeers.current.get(row.id)}
                   speed={samples.current.get(row.id)?.speed ?? 0}
                   onOpen={handleOpen}
                   onDelete={handleDelete}
@@ -923,12 +928,13 @@ function hostnameOf(url: string): string | null {
 const ROW_DRAG = "application/x-spool-row";
 
 const Row = memo(function Row({
-  row, liveBytes, liveTotal, speed, onOpen, onDelete, onRename, onMove, onReorder,
+  row, liveBytes, liveTotal, livePeers, speed, onOpen, onDelete, onRename, onMove, onReorder,
   selectMode, selected, onSelect, onFail,
 }: {
   row: DownloadView;
   liveBytes?: number;
   liveTotal?: number;
+  livePeers?: { peers: number | null; peers_total: number | null };
   speed: number;
   onOpen: (id: string) => void;
   onDelete: (id: string) => void;
@@ -949,6 +955,8 @@ const Row = memo(function Row({
   const percent = total ? Math.min(100, (downloaded / total) * 100) : null;
   const remaining = total ? total - downloaded : 0;
   const eta = row.status === "downloading" && speed > 0 ? formatEta(remaining / speed) : "";
+  const peers = livePeers?.peers ?? row.peers;
+  const peersTotal = livePeers?.peers_total ?? row.peers_total;
   // Only slide the placeholder bar when bytes are actually moving with no known
   // size. While a download is still resolving (yt-dlp probing, nothing
   // transferred yet) the bar sits at 0 rather than pretending to work.
@@ -1107,7 +1115,18 @@ const Row = memo(function Row({
               <>
                 <span className="font-medium text-primary">↓ {formatBytes(speed)}/s</span>
                 {eta && <span>{eta} left</span>}
-                {row.segments > 1 && <span className="hidden xs:inline">{row.segments} conns</span>}
+                {row.engine === "torrent" ? (
+                  peers !== undefined && peers !== null ? (
+                    <span className="hidden xs:inline">
+                      {peers} {peers === 1 ? "peer" : "peers"}
+                      {peersTotal ? ` (${peersTotal} in swarm)` : ""}
+                    </span>
+                  ) : (
+                    <span className="hidden xs:inline">swarm</span>
+                  )
+                ) : (
+                  row.segments > 1 && <span className="hidden xs:inline">{row.segments} conns</span>
+                )}
               </>
             )}
             {(row.status === "queued" || row.status === "interrupted") && (

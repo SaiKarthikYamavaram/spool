@@ -76,6 +76,10 @@ describe("classify", () => {
 
   it("treats a manifest as video so it is routed to yt-dlp", () => {
     expect(ext.classify("application/vnd.apple.mpegurl", "live.m3u8")).toBe("video");
+    expect(ext.classify("application/x-mpegurl", "playlist")).toBe("video");
+    expect(ext.classify("application/dash+xml", "manifest")).toBe("video");
+    expect(ext.classify("", "stream.mpd")).toBe("video");
+    expect(ext.classify("text/plain", "video", "https://hls2.vcdnx.com/hls/abc/manifest")).toBe("video");
   });
 });
 
@@ -141,13 +145,34 @@ describe("isStreamManifest", () => {
     expect(ext.isStreamManifest("https://e.test/live.m3u8?token=abc")).toBe(true);
     expect(ext.isStreamManifest("https://e.test/v.mpd#t=10")).toBe(true);
     expect(ext.isStreamManifest("https://e.test/LIVE.M3U8")).toBe(true);
+    expect(ext.isStreamManifest("https://hls2.vcdnx.com/hls/TWUyWTMyeCs5dnU4M1d5OC9xMUhHUT09/xfgdYshjhYhj=!sdsHsyG")).toBe(true);
+    expect(ext.isStreamManifest("https://ww7.vcdnlare.com/v/KgqFVYOinPWo9s9?sid=7816&t=hls")).toBe(true);
+    expect(ext.isStreamManifest("https://e.test/stream", "application/vnd.apple.mpegurl")).toBe(true);
   });
 
-  it("does not match a plain file or a manifest name inside a longer one", () => {
+  it("does not match a plain file, asset script, or segment", () => {
     expect(ext.isStreamManifest("https://e.test/video.mp4")).toBe(false);
     expect(ext.isStreamManifest("https://e.test/get?f=movie.m3u8.txt")).toBe(false);
+    expect(ext.isStreamManifest("https://e.test/hls/player.js")).toBe(false);
+    expect(ext.isStreamManifest("https://hls2.vcdnx.com/hls/TWUy/chunk?ts=20")).toBe(false);
     expect(ext.isStreamManifest("")).toBe(false);
     expect(ext.isStreamManifest(null)).toBe(false);
+  });
+});
+
+describe("isStreamSegment", () => {
+  it("detects HLS and DASH stream chunks and fragments", () => {
+    expect(ext.isStreamSegment("https://hls2.vcdnx.com/hls/TWUy/seg?ts=20")).toBe(true);
+    expect(ext.isStreamSegment("https://e.test/hls/seg-12.ts")).toBe(true);
+    expect(ext.isStreamSegment("https://e.test/dash/chunk_001.m4s")).toBe(true);
+    expect(ext.isStreamSegment("https://e.test/stream/part-5.mp4")).toBe(true);
+  });
+
+  it("does not flag playlists or full video files as segments", () => {
+    expect(ext.isStreamSegment("https://e.test/live.m3u8")).toBe(false);
+    expect(ext.isStreamSegment("https://e.test/movie.mp4")).toBe(false);
+    expect(ext.isStreamSegment("https://e.test/recording.ts")).toBe(false);
+    expect(ext.isStreamSegment("")).toBe(false);
   });
 });
 

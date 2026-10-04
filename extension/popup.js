@@ -91,13 +91,16 @@ function render(items) {
   allBar.hidden = false;
 
   for (const it of items) {
+    const isStream = it.isStream || isStreamManifest(it.url);
+    const tagText = isStream ? "HLS" : (it.type === "video" ? "VID" : TYPE_LABEL[it.type] || "BIN");
+    const subText = isStream ? "stream · via yt-dlp" : `${it.type} · ${fmtSize(it.size)}`;
     const row = document.createElement("div");
     row.className = "item";
     row.innerHTML = `
-      <span class="tag" data-type="${isStreamManifest(it.url) ? "video" : escapeAttr(it.type)}">${isStreamManifest(it.url) ? "HLS" : TYPE_LABEL[it.type] || "BIN"}</span>
+      <span class="tag" data-type="${isStream ? "video" : escapeAttr(it.type)}">${tagText}</span>
       <div class="meta">
         <div class="name" title="${escapeAttr(it.url)}">${escapeHtml(it.filename)}</div>
-        <div class="sub">${isStreamManifest(it.url) ? "stream · via yt-dlp" : `${it.type} · ${fmtSize(it.size)}`}</div>
+        <div class="sub">${subText}</div>
       </div>
       <button class="dl">Download</button>`;
     row.querySelector(".dl").addEventListener("click", async (e) => {
@@ -106,9 +109,9 @@ function render(items) {
       await chrome.runtime.sendMessage({
         type: "download",
         url: it.url,
-        referer,
-        // A manifest must be handed to yt-dlp or we would save the playlist.
-        video: isStreamManifest(it.url),
+        referer: it.referer || referer,
+        // A manifest or video stream must be handed to yt-dlp
+        video: isStream || it.type === "video",
       });
     });
     listEl.appendChild(row);

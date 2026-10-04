@@ -43,23 +43,88 @@ async function setSettings(patch) {
   return next;
 }
 
+const STREAM_MIMES = [
+  "application/vnd.apple.mpegurl",
+  "application/x-mpegurl",
+  "audio/x-mpegurl",
+  "application/dash+xml",
+  "application/vnd.ms-sstr+xml",
+  "application/x-hls",
+];
+
+const VIDEO_EXTS = [
+  "mp4", "mkv", "webm", "avi", "mov", "flv", "m3u8", "ts", "mpd", "m4s", "3gp", "wmv", "asf",
+];
+
+// Detect individual chunk / segment requests so we don't flood the detected list
+// with hundreds of 2-second clips while an adaptive stream is playing.
+function isStreamSegment(url) {
+  if (!url) return false;
+  if (/(?:[\?&](?:ts|segment|chunk|frag|range)=\d+)/i.test(url)) return true;
+  if (/(?:seg|segment|chunk|frag|fragment|part)[-_]?\d+\.(?:ts|m4s|mp4|aac)/i.test(url)) return true;
+  if (/\.(ts|m4s)(\?|#|$)/i.test(url) && /(?:hls|dash|playlist|stream)/i.test(url)) return true;
+  return false;
+}
+
+// HLS/DASH manifests are playlists, not files — downloading one over HTTP just
+// saves a few KB of text. They have to go through yt-dlp, which fetches the
+// segments and muxes them.
+function isStreamManifest(url, contentType = "") {
+  if (!url && !contentType) return false;
+  if (isStreamSegment(url)) return false;
+
+  const ct = (contentType || "").toLowerCase().split(";")[0].trim();
+  if (STREAM_MIMES.includes(ct)) return true;
+
+  const u = url || "";
+  if (/\.(m3u8|mpd)(\?|#|$)/i.test(u)) return true;
+
+  // Adaptive streaming paths or query parameters
+  if (/(?:[\/=]hls[\/=\.]|[\/=]dash[\/=\.]|[\?&](?:t|format|type)=(?:hls|m3u8|mpd)\b|\/playlist|\/manifest)/i.test(u)) {
+    if (/\.(js|css|json|html|htm|png|jpg|jpeg|gif|svg|woff2?|map)(\?|#|$)/i.test(u)) return false;
+    return true;
+  }
+  return false;
+}
+
 // Map a Content-Type / filename to one of the type buckets, or null if it is
 // not something worth downloading (html, json, css, ...).
-function classify(contentType, filename) {
+function classify(contentType, filename, url = "") {
   const ct = (contentType || "").toLowerCase().split(";")[0].trim();
   const ext = (filename || "").toLowerCase().split(".").pop() || "";
 
-  if (ct.startsWith("video/") || ["mp4", "mkv", "webm", "avi", "mov", "flv", "m3u8", "ts"].includes(ext)) return "video";
-  if (ct.startsWith("audio/") || ["mp3", "flac", "wav", "aac", "ogg", "m4a"].includes(ext)) return "audio";
+  // Explicit non-downloadable page furniture
+  if (
+    ["text/html", "text/css", "application/javascript", "text/javascript", "application/json", "text/json"].includes(ct) &&
+    !isStreamManifest(url, ct)
+  ) {
+    return null;
+  }
+
+  if (
+    ct.startsWith("video/") ||
+    STREAM_MIMES.includes(ct) ||
+    VIDEO_EXTS.includes(ext) ||
+    (url && isStreamManifest(url, ct))
+  ) {
+    return "video";
+  }
+
+  if (ct.startsWith("audio/") || ["mp3", "flac", "wav", "aac", "ogg", "m4a", "opus", "wma"].includes(ext)) {
+    return "audio";
+  }
+
   if (
     ["application/zip", "application/x-tar", "application/x-7z-compressed", "application/x-rar-compressed",
      "application/gzip", "application/x-bzip2"].includes(ct) ||
     ["zip", "tar", "gz", "xz", "7z", "rar", "bz2"].includes(ext)
   ) return "archive";
+
   if (
     ["application/pdf", "application/msword", "application/epub+zip"].includes(ct) ||
     ["pdf", "doc", "docx", "epub"].includes(ext)
   ) return "document";
+
   if (ct.startsWith("image/") || ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"].includes(ext)) return "image";
 
   // A generic binary or an explicit attachment is downloadable but untyped.
@@ -82,13 +147,6 @@ const VIDEO_HOSTS = [
   "twitter.com", "x.com", "reddit.com", "soundcloud.com",
   "bilibili.com", "nicovideo.jp", "streamable.com",
 ];
-
-// HLS/DASH manifests are playlists, not files — downloading one over HTTP just
-// saves a few KB of text. They have to go through yt-dlp, which fetches the
-// segments and muxes them.
-function isStreamManifest(url) {
-  return /\.(m3u8|mpd)(\?|#|$)/i.test(url || "");
-}
 
 function isVideoSite(url) {
   const h = hostOf(url).toLowerCase();
@@ -130,12 +188,12 @@ function shouldTakeOver(item, settings) {
   if (!url || !/^https?:/i.test(url)) return false;
   if (isExcluded(url, settings)) return false;
 
-  const type = classify(item.mime, item.filename || filenameFromUrl(url));
+  const type = classify(item.mime, item.filename || filenameFromUrl(url), url);
   if (!type || !settings.types[type]) return false;
 
   // fileSize is often -1 or 0 at this point; only a known, genuinely small
-  // file is skipped.
-  if (item.fileSize > 0 && item.fileSize < settings.minSizeKb * 1024) return false;
+  // file is skipped. Manifests bypass the size floor.
+  if (!isStreamManifest(url, item.mime) && item.fileSize > 0 && item.fileSize < settings.minSizeKb * 1024) return false;
 
   return true;
 }

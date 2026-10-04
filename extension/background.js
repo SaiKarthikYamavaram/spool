@@ -69,26 +69,48 @@ async function maybeDetect(details) {
   const length = parseInt(headers["content-length"] || "0", 10);
 
   const filename = filenameFromDisposition(disposition) || filenameFromUrl(details.url);
-  const type = classify(contentType, filename);
+  const type = classify(contentType, filename, details.url);
   if (!type) return;
 
-  // Type must be enabled, and size must clear the floor (unless the server
-  // sent no length — common for streams, which we still want to surface).
+  // Type must be enabled in settings
   if (!settings.types[type]) return;
+
+  // Skip stream chunks/segments so we don't flood the list with hundreds of 2-second clips
+  if (isStreamSegment(details.url)) return;
+
+  const isStream = isStreamManifest(details.url, contentType);
   // A manifest is tiny by nature; the size floor would always reject it.
-  if (!isStreamManifest(details.url) && length && length < settings.minSizeKb * 1024) return;
+  if (!isStream && length && length < settings.minSizeKb * 1024) return;
 
   // An explicit attachment is always worth showing; otherwise require it to be
   // media or a sizeable binary, so ordinary page images/scripts don't flood.
   const isAttachment = /attachment/i.test(disposition);
   if (!isAttachment && (type === "image" || type === "document") && !length) return;
 
-  await addDetected(details.tabId, {
+  let title = filename;
+  let tab = null;
+  try {
+    tab = await chrome.tabs.get(details.tabId);
+    const vt = videoTitle(tab?.title);
+    if (vt && (type === "video" || isStream)) title = vt;
+  } catch { /* tab query may fail */ }
+
+  const item = {
     url: details.url,
-    filename,
+    filename: title,
     type,
     size: length || 0,
-  });
+    isStream,
+    referer: tab?.url || details.initiator || "",
+  };
+
+  await addDetected(details.tabId, item);
+
+  if (type === "video" || isStream) {
+    chrome.action.setBadgeText({ tabId: details.tabId, text: "▶" });
+    chrome.action.setBadgeBackgroundColor({ tabId: details.tabId, color: "#ef4444" });
+    if (tab) void offerPanel(details.tabId, tab, item);
+  }
 }
 
 function filenameFromDisposition(disposition) {
@@ -110,22 +132,39 @@ chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
   }
 });
 
-/// Put the in-page button on a video page, injecting the content script first
-/// (no static content_scripts entry, so nothing runs on pages we never use).
-async function offerPanel(tabId, tab) {
+/// Put the in-page button on a video page.
+async function offerPanel(tabId, tab, item = null) {
   const settings = await getSettings();
   if (!settings.enabled || !settings.showPanel) return;
   if (isExcluded(tab.url, settings)) return;
 
+  const targetUrl = item?.url || tab.url;
+  const referer = item?.referer || tab.url;
+  const isStream = item ? (item.isStream || isStreamManifest(item.url)) : true;
+  const name = item?.filename || videoTitle(tab.title) || "";
+  const label = name
+    ? `Download: ${name.length > 32 ? name.slice(0, 30) + "…" : name}`
+    : "Download this video";
+
+  const payload = {
+    type: "showPanel",
+    url: targetUrl,
+    referer,
+    video: isStream,
+    title: name,
+    label,
+  };
+
   try {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
-    await chrome.tabs.sendMessage(tabId, {
-      type: "showPanel",
-      url: tab.url,
-      label: videoTitle(tab.title) ? "Download this video" : "Download with spool",
-    });
+    await chrome.tabs.sendMessage(tabId, payload);
   } catch {
-    // Restricted page (store, PDF viewer, other extensions) — no panel there.
+    // If content script was not ready yet, inject and retry
+    try {
+      await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+      await chrome.tabs.sendMessage(tabId, payload);
+    } catch {
+      // Restricted page (store, PDF viewer, other extensions) — no panel there.
+    }
   }
 }
 chrome.tabs.onRemoved.addListener((tabId) => clearDetected(tabId));
@@ -331,17 +370,47 @@ chrome.commands?.onCommand.addListener(async (command) => {
 // Messages from popup
 // ---------------------------------------------------------------------------
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
-    if (msg.type === "getDetected") {
+    if (msg.type === "mediaFound") {
+      const tabId = sender.tab?.id;
+      if (tabId === undefined || tabId < 0) return;
+      const settings = await getSettings();
+      if (!settings.enabled || !settings.grabMedia) return;
+      if (isExcluded(msg.url, settings)) return;
+      if (isStreamSegment(msg.url)) return;
+
+      const isStream = msg.isStream || isStreamManifest(msg.url, msg.mime);
+      const title = videoTitle(msg.title) || filenameFromUrl(msg.url);
+
+      const item = {
+        url: msg.url,
+        filename: title,
+        type: "video",
+        size: msg.size || 0,
+        isStream,
+        referer: msg.pageUrl || sender.tab?.url || "",
+      };
+
+      await addDetected(tabId, item);
+      chrome.action.setBadgeText({ tabId, text: "▶" });
+      chrome.action.setBadgeBackgroundColor({ tabId, color: "#ef4444" });
+
+      if (sender.tab) {
+        void offerPanel(tabId, sender.tab, item);
+      }
+      sendResponse({ ok: true });
+    } else if (msg.type === "getDetected") {
       sendResponse({ items: await getDetected(msg.tabId), alive: await spoolAlive() });
     } else if (msg.type === "download") {
-      sendResponse({ ok: await sendToSpool(msg.url, msg.referer, msg.video || false) });
+      const isStream = msg.video || isStreamManifest(msg.url);
+      sendResponse({ ok: await sendToSpool(msg.url, msg.referer, isStream) });
     } else if (msg.type === "downloadAll") {
       const items = await getDetected(msg.tabId);
       let ok = 0;
       for (const it of items) {
-        if (await sendToSpool(it.url, msg.referer, isStreamManifest(it.url), false)) ok++;
+        const isStream = it.isStream || isStreamManifest(it.url);
+        if (await sendToSpool(it.url, it.referer || msg.referer, isStream, false)) ok++;
       }
       sendResponse({ ok, total: items.length });
     } else if (msg.type === "clear") {

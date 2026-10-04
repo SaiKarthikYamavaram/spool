@@ -41,7 +41,19 @@ pub fn is_stream_manifest(url: &str) -> bool {
         return false;
     }
     let path = parsed.path().to_ascii_lowercase();
-    path.ends_with(".m3u8") || path.ends_with(".mpd")
+    if path.ends_with(".m3u8") || path.ends_with(".mpd") {
+        return true;
+    }
+    let has_hls_query = parsed.query().map_or(false, |q| {
+        q.contains("t=hls") || q.contains("format=m3u8") || q.contains("type=hls")
+    });
+    let has_hls_path = path.contains("/hls/") || path.contains("/dash/") || path.ends_with("/playlist") || path.ends_with("/manifest");
+    if has_hls_query || has_hls_path {
+        let is_asset = path.ends_with(".js") || path.ends_with(".css") || path.ends_with(".json") || path.ends_with(".html") || path.ends_with(".png") || path.ends_with(".jpg");
+        let is_segment = path.ends_with(".ts") || path.ends_with(".m4s") || parsed.query().map_or(false, |q| q.contains("ts=") || q.contains("segment="));
+        return !is_asset && !is_segment;
+    }
+    false
 }
 
 pub fn is_video_site(url: &str) -> bool {
@@ -396,6 +408,10 @@ mod tests {
     fn detects_stream_manifests() {
         assert!(is_stream_manifest("https://e.test/live/x36xhzz.m3u8"));
         assert!(is_stream_manifest("https://e.test/v.mpd?token=abc"));
+        assert!(is_stream_manifest("https://hls2.vcdnx.com/hls/TWUy/master"));
+        assert!(is_stream_manifest("https://ww7.vcdnlare.com/v/123?sid=7816&t=hls"));
+        assert!(!is_stream_manifest("https://hls2.vcdnx.com/hls/TWUy/chunk?ts=20"));
+        assert!(!is_stream_manifest("https://e.test/hls/script.js"));
         assert!(!is_stream_manifest("https://e.test/video.mp4"));
         // Only the path counts, not a query string that merely mentions it.
         assert!(!is_stream_manifest("https://e.test/get?f=movie.m3u8.txt"));

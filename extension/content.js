@@ -8,6 +8,133 @@
   if (window.__spoolPanel) return; // survive re-injection
   window.__spoolPanel = true;
 
+  // ---------------------------------------------------------------------------
+  // Media Sniffing (all frames: top frame & player iframes)
+  // ---------------------------------------------------------------------------
+  const reportedUrls = new Set();
+
+  function reportMedia(url, mime = "", title = "", isStream = false) {
+    if (!url || !/^https?:/i.test(url)) return;
+    if (reportedUrls.has(url)) return;
+    reportedUrls.add(url);
+
+    try {
+      chrome.runtime.sendMessage({
+        type: "mediaFound",
+        url,
+        mime,
+        title: title || document.title || "",
+        pageUrl: location.href,
+        isStream,
+      });
+    } catch {
+      // Worker suspended or extension context invalidated
+    }
+  }
+
+  function inspectMedia(el) {
+    if (!el) return;
+    const isVideo = el.tagName?.toLowerCase() === "video";
+    const title = el.getAttribute("title") || el.getAttribute("data-title") || document.title || "";
+
+    // 1. Direct src attribute or currentSrc
+    const src = el.currentSrc || el.src;
+    if (src && /^https?:/i.test(src)) {
+      const isStream = /mpegurl|dash|hls/i.test(el.type || "") || /\.(m3u8|mpd)/i.test(src);
+      reportMedia(src, el.type || (isVideo ? "video/mp4" : "audio/mpeg"), title, isStream);
+    }
+
+    // 2. <source> child elements
+    const sources = el.querySelectorAll("source");
+    for (const s of sources) {
+      const sSrc = s.src || s.getAttribute("src");
+      const sType = s.type || s.getAttribute("type") || "";
+      if (sSrc && /^https?:/i.test(sSrc)) {
+        const isStream = /mpegurl|dash|hls/i.test(sType) || /\.(m3u8|mpd)/i.test(sSrc);
+        reportMedia(sSrc, sType || (isVideo ? "video/mp4" : "audio/mpeg"), title, isStream);
+      }
+    }
+
+    // 3. Blob / player fallback inside an iframe
+    if ((!src || src.startsWith("blob:")) && window !== window.top) {
+      if (document.title || /(?:hls|player|video|v\/)/i.test(location.href)) {
+        reportMedia(location.href, "video/mp4", document.title || "", true);
+      }
+    }
+  }
+
+  function inspectIframe(iframe) {
+    const src = iframe.src || iframe.getAttribute("src");
+    if (!src || !/^https?:/i.test(src)) return;
+    if (
+      /(?:[\?&]t=hls\b|\.(m3u8|mpd)|\/(?:video|embed|v|player|watch)\/|vcdnlare|streamvin|streamtape|doodstream|mixdrop|supervideo|filemoon|voe|streamwish|vidmoly|upstream)/i.test(src)
+    ) {
+      reportMedia(src, "video/mp4", document.title || "", true);
+    }
+  }
+
+  function scanMedia() {
+    document.querySelectorAll("video, audio").forEach(inspectMedia);
+    if (window === window.top) {
+      document.querySelectorAll("iframe").forEach(inspectIframe);
+    }
+  }
+
+  scanMedia();
+
+  // Watch for dynamic video injection (e.g. user clicks Play button)
+  const observer = new MutationObserver((mutations) => {
+    for (const m of mutations) {
+      for (const node of m.addedNodes) {
+        if (node.nodeType !== 1) continue;
+        const tag = node.tagName?.toLowerCase();
+        if (tag === "video" || tag === "audio") {
+          inspectMedia(node);
+        } else if (tag === "source" && node.parentElement?.tagName?.toLowerCase() === "video") {
+          inspectMedia(node.parentElement);
+        } else if (tag === "iframe" && window === window.top) {
+          inspectIframe(node);
+        } else if (node.querySelectorAll) {
+          node.querySelectorAll("video, audio").forEach(inspectMedia);
+          if (window === window.top) {
+            node.querySelectorAll("iframe").forEach(inspectIframe);
+          }
+        }
+      }
+      if (m.type === "attributes" && (m.attributeName === "src" || m.attributeName === "currentSrc")) {
+        const tag = m.target.tagName?.toLowerCase();
+        if (tag === "video" || tag === "audio") {
+          inspectMedia(m.target);
+        } else if (tag === "iframe" && window === window.top) {
+          inspectIframe(m.target);
+        }
+      }
+    }
+  });
+
+  if (document.documentElement) {
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["src"],
+    });
+  }
+
+  // Capture media events when playback starts or media is loaded
+  ["play", "playing", "loadedmetadata", "canplay", "loadstart"].forEach((ev) => {
+    document.addEventListener(ev, (e) => {
+      if (e.target && (e.target.tagName === "VIDEO" || e.target.tagName === "AUDIO")) {
+        inspectMedia(e.target);
+      }
+    }, true);
+  });
+
+  // ---------------------------------------------------------------------------
+  // In-page download panel (Top frame only)
+  // ---------------------------------------------------------------------------
+  if (window !== window.top) return;
+
   const ID = "spool-panel";
   let panel = null;
   let hideTimer = null;
@@ -177,8 +304,8 @@
         const res = await chrome.runtime.sendMessage({
           type: "download",
           url: msg.url,
-          referer: location.href,
-          video: true,
+          referer: msg.referer || location.href,
+          video: msg.video !== undefined ? msg.video : true,
         });
         return !!res?.ok;
       });

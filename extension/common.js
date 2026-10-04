@@ -74,6 +74,11 @@ function isStreamManifest(url, contentType = "") {
   if (isStreamSegment(url)) return false;
 
   const ct = (contentType || "").toLowerCase().split(";")[0].trim();
+  // An HTML document or styling/script is never a stream playlist
+  if (["text/html", "text/css", "application/javascript", "text/javascript", "application/json"].includes(ct)) {
+    return false;
+  }
+
   if (STREAM_MIMES.includes(ct)) return true;
 
   const u = url || "";
@@ -81,7 +86,7 @@ function isStreamManifest(url, contentType = "") {
 
   // Adaptive streaming paths or query parameters
   if (/(?:[\/=]hls[\/=\.]|[\/=]dash[\/=\.]|[\?&](?:t|format|type)=(?:hls|m3u8|mpd)\b|\/playlist|\/manifest)/i.test(u)) {
-    if (/\.(js|css|json|html|htm|png|jpg|jpeg|gif|svg|woff2?|map)(\?|#|$)/i.test(u)) return false;
+    if (/\.(js|css|json|html?|png|jpg|jpeg|gif|svg|woff2?|map)(\?|#|$)/i.test(u)) return false;
     return true;
   }
   return false;
@@ -93,10 +98,9 @@ function classify(contentType, filename, url = "") {
   const ct = (contentType || "").toLowerCase().split(";")[0].trim();
   const ext = (filename || "").toLowerCase().split(".").pop() || "";
 
-  // Explicit non-downloadable page furniture
+  // Explicit non-downloadable page furniture — HTML is never a media file
   if (
-    ["text/html", "text/css", "application/javascript", "text/javascript", "application/json", "text/json"].includes(ct) &&
-    !isStreamManifest(url, ct)
+    ["text/html", "text/css", "application/javascript", "text/javascript", "application/json", "text/json"].includes(ct)
   ) {
     return null;
   }

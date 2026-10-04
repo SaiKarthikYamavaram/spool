@@ -39,9 +39,11 @@
 
     // 1. Direct src attribute or currentSrc
     const src = el.currentSrc || el.src;
-    if (src && /^https?:/i.test(src)) {
-      const isStream = /mpegurl|dash|hls/i.test(el.type || "") || /\.(m3u8|mpd)/i.test(src);
-      reportMedia(src, el.type || (isVideo ? "video/mp4" : "audio/mpeg"), title, isStream);
+    if (src && /^https?:/i.test(src) && !src.startsWith("blob:")) {
+      if (!/\.(html?|php|jsp|asp)(\?|#|$)/i.test(src) || /(?:m3u8|mpd)/i.test(src)) {
+        const isStream = /mpegurl|dash|hls/i.test(el.type || "") || /\.(m3u8|mpd)/i.test(src);
+        reportMedia(src, el.type || (isVideo ? "video/mp4" : "audio/mpeg"), title, isStream);
+      }
     }
 
     // 2. <source> child elements
@@ -49,35 +51,43 @@
     for (const s of sources) {
       const sSrc = s.src || s.getAttribute("src");
       const sType = s.type || s.getAttribute("type") || "";
-      if (sSrc && /^https?:/i.test(sSrc)) {
-        const isStream = /mpegurl|dash|hls/i.test(sType) || /\.(m3u8|mpd)/i.test(sSrc);
-        reportMedia(sSrc, sType || (isVideo ? "video/mp4" : "audio/mpeg"), title, isStream);
-      }
-    }
-
-    // 3. Blob / player fallback inside an iframe
-    if ((!src || src.startsWith("blob:")) && window !== window.top) {
-      if (document.title || /(?:hls|player|video|v\/)/i.test(location.href)) {
-        reportMedia(location.href, "video/mp4", document.title || "", true);
+      if (sSrc && /^https?:/i.test(sSrc) && !sSrc.startsWith("blob:")) {
+        if (!/\.(html?|php|jsp|asp)(\?|#|$)/i.test(sSrc) || /(?:m3u8|mpd)/i.test(sSrc)) {
+          const isStream = /mpegurl|dash|hls/i.test(sType) || /\.(m3u8|mpd)/i.test(sSrc);
+          reportMedia(sSrc, sType || (isVideo ? "video/mp4" : "audio/mpeg"), title, isStream);
+        }
       }
     }
   }
 
-  function inspectIframe(iframe) {
-    const src = iframe.src || iframe.getAttribute("src");
-    if (!src || !/^https?:/i.test(src)) return;
-    if (
-      /(?:[\?&]t=hls\b|\.(m3u8|mpd)|\/(?:video|embed|v|player|watch)\/|vcdnlare|streamvin|streamtape|doodstream|mixdrop|supervideo|filemoon|voe|streamwish|vidmoly|upstream)/i.test(src)
-    ) {
-      reportMedia(src, "video/mp4", document.title || "", true);
-    }
+  // Resolve direct stream from embedded Streamvin / PlayerLare frames
+  function resolveStreamvin() {
+    if (!/streamvin\.com/i.test(location.hostname)) return;
+    const match = location.pathname.match(/\/video\/([a-zA-Z0-9]+)/);
+    if (!match) return;
+    const hash = match[1];
+    fetch("/player/index.php?data=" + encodeURIComponent(hash) + "&do=getVideo", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-Requested-With": "XMLHttpRequest",
+      },
+      body: "hash=" + encodeURIComponent(hash) + "&r=" + encodeURIComponent(document.referrer || location.href),
+    })
+      .then((r) => r.json())
+      .then((data) => {
+        const streamUrl = data.securedLink || data.videoSource;
+        if (streamUrl && /^https?:/i.test(streamUrl)) {
+          const title = data.title || document.title || "Video";
+          reportMedia(streamUrl, "application/x-mpegURL", title, true);
+        }
+      })
+      .catch(() => {});
   }
 
   function scanMedia() {
     document.querySelectorAll("video, audio").forEach(inspectMedia);
-    if (window === window.top) {
-      document.querySelectorAll("iframe").forEach(inspectIframe);
-    }
+    resolveStreamvin();
   }
 
   scanMedia();
@@ -92,21 +102,14 @@
           inspectMedia(node);
         } else if (tag === "source" && node.parentElement?.tagName?.toLowerCase() === "video") {
           inspectMedia(node.parentElement);
-        } else if (tag === "iframe" && window === window.top) {
-          inspectIframe(node);
         } else if (node.querySelectorAll) {
           node.querySelectorAll("video, audio").forEach(inspectMedia);
-          if (window === window.top) {
-            node.querySelectorAll("iframe").forEach(inspectIframe);
-          }
         }
       }
       if (m.type === "attributes" && (m.attributeName === "src" || m.attributeName === "currentSrc")) {
         const tag = m.target.tagName?.toLowerCase();
         if (tag === "video" || tag === "audio") {
           inspectMedia(m.target);
-        } else if (tag === "iframe" && window === window.top) {
-          inspectIframe(m.target);
         }
       }
     }

@@ -68,6 +68,11 @@ async function maybeDetect(details) {
   const contentType = headers["content-type"] || "";
   const length = parseInt(headers["content-length"] || "0", 10);
 
+  // An HTML document navigation is never downloadable media
+  if ((details.type === "main_frame" || details.type === "sub_frame") && contentType.toLowerCase().includes("text/html")) {
+    return;
+  }
+
   const filename = filenameFromDisposition(disposition) || filenameFromUrl(details.url);
   const type = classify(contentType, filename, details.url);
   if (!type) return;
@@ -101,7 +106,7 @@ async function maybeDetect(details) {
     type,
     size: length || 0,
     isStream,
-    referer: tab?.url || details.initiator || "",
+    referer: details.initiator || tab?.url || "",
   };
 
   await addDetected(details.tabId, item);

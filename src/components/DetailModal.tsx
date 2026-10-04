@@ -47,9 +47,9 @@ export function DetailModal({
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className={cn("max-h-[88vh] overflow-y-auto w-[calc(100vw-2rem)] p-4 sm:p-6", row.engine === "torrent" ? "sm:max-w-xl" : "sm:max-w-lg")}>
+      <DialogContent className={cn("max-h-[88vh] overflow-y-auto overflow-x-hidden w-[calc(100vw-2rem)] p-4 sm:p-6", row.engine === "torrent" ? "sm:max-w-3xl" : "sm:max-w-2xl")}>
         <DialogHeader>
-          <DialogTitle className="truncate text-base sm:text-lg" title={row.filename}>{row.filename}</DialogTitle>
+          <DialogTitle className="break-all whitespace-normal text-base sm:text-lg" title={row.filename}>{row.filename}</DialogTitle>
         </DialogHeader>
 
         {row.thumbnail && (
@@ -72,7 +72,7 @@ export function DetailModal({
           </div>
         </div>
 
-        <dl className="grid grid-cols-1 xs:grid-cols-[auto_1fr] gap-x-3 sm:gap-x-4 gap-y-1.5 sm:gap-y-2 text-xs sm:text-sm">
+        <dl className="grid grid-cols-1 xs:grid-cols-[auto_minmax(0,1fr)] gap-x-3 sm:gap-x-4 gap-y-1.5 sm:gap-y-2 text-xs sm:text-sm min-w-0">
           <Field label="Status" value={cap(row.status)} />
           <Field label="Saved to" value={row.path} mono copyable />
           <Field label="Source URL" value={row.url} mono copyable />
@@ -229,11 +229,12 @@ function Checksum({ id }: { id: string }) {
 
       {digest && (
         <>
-          <div className="flex items-center gap-1.5 rounded-md border border-border/60 bg-muted/30 p-2">
+          <div className="flex items-center gap-1.5 rounded-md border border-border/60 bg-muted/30 p-2 min-w-0">
             <code className="min-w-0 flex-1 break-all font-mono text-[11px]">{digest}</code>
             <Button
               variant="ghost"
               size="icon-xs"
+              className="shrink-0"
               title="Copy checksum"
               onClick={() => {
                 navigator.clipboard
@@ -273,13 +274,14 @@ function Field({
 }: { label: string; value: string; mono?: boolean; copyable?: boolean; error?: boolean }) {
   return (
     <>
-      <dt className="text-muted-foreground">{label}</dt>
-      <dd className={`flex items-center gap-1.5 truncate ${mono ? "font-mono" : ""} ${error ? "text-destructive" : ""}`}>
-        <span className="truncate" title={value}>{value}</span>
+      <dt className="text-muted-foreground shrink-0 self-start pt-0.5">{label}</dt>
+      <dd className={`flex items-start justify-between gap-2 min-w-0 ${mono ? "font-mono" : ""} ${error ? "text-destructive" : ""}`}>
+        <span className="break-all whitespace-normal min-w-0 select-text" title={value}>{value}</span>
         {copyable && (
           <Button
             variant="ghost"
             size="icon-xs"
+            className="shrink-0 -mt-0.5"
             title={`Copy ${label}`}
             onClick={() => {
               navigator.clipboard
@@ -288,7 +290,7 @@ function Field({
                 .catch((e) => toast.error(String(e)));
             }}
           >
-            <Copy />
+            <Copy className="size-3" />
           </Button>
         )}
       </dd>
@@ -385,14 +387,15 @@ function TorrentSection({
       </div>
 
       {/* Torrent metadata */}
-      <div className="rounded-md border border-border/60 bg-muted/20 p-2.5 text-xs space-y-1.5 font-mono">
-        <div className="flex items-center justify-between gap-2">
-          <span className="text-muted-foreground shrink-0">BTIH Info Hash</span>
-          <div className="flex items-center gap-1 min-w-0">
-            <span className="truncate select-all text-[11px]">{details.info_hash}</span>
+      <div className="rounded-md border border-border/60 bg-muted/20 p-2.5 text-xs space-y-1.5 font-mono min-w-0">
+        <div className="flex items-start justify-between gap-2 min-w-0">
+          <span className="text-muted-foreground shrink-0 self-start pt-0.5">BTIH Info Hash</span>
+          <div className="flex items-start gap-1 min-w-0">
+            <span className="break-all select-all text-[11px] min-w-0">{details.info_hash}</span>
             <Button
               variant="ghost"
               size="icon-xs"
+              className="shrink-0 -mt-0.5"
               title="Copy Info Hash"
               onClick={() => {
                 navigator.clipboard.writeText(details.info_hash);
@@ -403,7 +406,7 @@ function TorrentSection({
             </Button>
           </div>
         </div>
-        <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+        <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground min-w-0">
           <span>Pieces</span>
           <span>
             {details.pieces_count.toLocaleString()} pieces × {formatBytes(details.piece_length)}
@@ -413,7 +416,7 @@ function TorrentSection({
 
       {/* Trackers list */}
       {details.trackers.length > 0 && (
-        <div className="space-y-1.5">
+        <div className="space-y-1.5 min-w-0">
           <div className="flex items-center justify-between text-xs">
             <span className="font-medium">Trackers ({details.trackers.length})</span>
             <Button
@@ -426,9 +429,9 @@ function TorrentSection({
             </Button>
           </div>
           {showTrackers && (
-            <div className="max-h-28 overflow-y-auto rounded border border-border/60 bg-background/50 p-2 text-[11px] font-mono divide-y divide-border/30">
+            <div className="max-h-28 overflow-y-auto overflow-x-hidden rounded border border-border/60 bg-background/50 p-2 text-[11px] font-mono divide-y divide-border/30 min-w-0">
               {details.trackers.map((tr, i) => (
-                <div key={i} className="py-1 truncate" title={tr}>
+                <div key={i} className="py-1 break-all whitespace-normal min-w-0" title={tr}>
                   {tr}
                 </div>
               ))}
@@ -438,7 +441,7 @@ function TorrentSection({
       )}
 
       {/* Files Manager table */}
-      <div className="space-y-2">
+      <div className="space-y-2 min-w-0">
         <div className="flex items-center justify-between text-xs">
           <span className="font-medium">
             Files ({selectedCount} of {details.files.length} selected)
@@ -467,26 +470,27 @@ function TorrentSection({
           )}
         </div>
 
-        <div className="max-h-56 overflow-y-auto rounded border border-border/60 divide-y divide-border/40 bg-background/50 text-xs">
+        <div className="max-h-56 overflow-y-auto overflow-x-hidden rounded border border-border/60 divide-y divide-border/40 bg-background/50 text-xs min-w-0">
           {details.files.map((f) => {
             const pct = f.length > 0 ? Math.min(100, (f.downloaded / f.length) * 100) : 100;
 
             return (
-              <div key={f.id} className="p-2 space-y-1 hover:bg-muted/30">
-                <div className="flex items-center gap-2">
+              <div key={f.id} className="p-2 space-y-1 hover:bg-muted/30 min-w-0">
+                <div className="flex items-start gap-2 min-w-0">
                   {row.status !== "completed" ? (
                     <Checkbox
                       checked={f.selected}
                       disabled={updating}
+                      className="shrink-0 mt-0.5"
                       onCheckedChange={(checked) => handleToggleFile(f.id, checked === true)}
                     />
                   ) : (
-                    <Check className="size-3.5 text-emerald-500 shrink-0" />
+                    <Check className="size-3.5 text-emerald-500 shrink-0 mt-0.5" />
                   )}
-                  <span className="font-mono text-[11px] truncate flex-1 min-w-0" title={f.path}>
+                  <span className="font-mono text-[11px] break-all whitespace-normal flex-1 min-w-0" title={f.path}>
                     {f.path}
                   </span>
-                  <span className="font-mono text-[11px] text-muted-foreground shrink-0 tabular-nums">
+                  <span className="font-mono text-[11px] text-muted-foreground shrink-0 tabular-nums ml-1">
                     {formatBytes(f.length)}
                   </span>
                   {f.full_path && (

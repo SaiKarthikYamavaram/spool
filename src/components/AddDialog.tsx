@@ -364,16 +364,17 @@ export function AddDialog({
                       </Button>
                     </div>
 
-                    <div className="max-h-48 overflow-y-auto rounded border border-border/60 divide-y divide-border/40 bg-background/60 text-xs">
+                    <div className="max-h-48 overflow-y-auto overflow-x-hidden rounded border border-border/60 divide-y divide-border/40 bg-background/60 text-xs min-w-0">
                       {torrentDetails.files.map((f) => {
                         const isChecked = selectedFileIds.has(f.id);
                         return (
                           <label
                             key={f.id}
-                            className="flex items-center gap-2 px-2 py-1.5 hover:bg-muted/50 cursor-pointer select-none"
+                            className="flex items-start gap-2 px-2 py-1.5 hover:bg-muted/50 cursor-pointer select-none min-w-0"
                           >
                             <Checkbox
                               checked={isChecked}
+                              className="shrink-0 mt-0.5"
                               onCheckedChange={(checked) => {
                                 setSelectedFileIds((prev) => {
                                   const next = new Set(prev);
@@ -386,10 +387,10 @@ export function AddDialog({
                                 });
                               }}
                             />
-                            <span className="truncate flex-1 font-mono text-[11px]" title={f.path}>
+                            <span className="break-all whitespace-normal flex-1 font-mono text-[11px] min-w-0" title={f.path}>
                               {f.path}
                             </span>
-                            <span className="font-mono text-[10px] text-muted-foreground shrink-0 tabular-nums">
+                            <span className="font-mono text-[10px] text-muted-foreground shrink-0 tabular-nums ml-1">
                               {formatBytes(f.length)}
                             </span>
                           </label>

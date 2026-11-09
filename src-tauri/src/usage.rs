@@ -78,6 +78,21 @@ pub fn sample() -> Usage {
     Usage { cpu: None, rss: 0 }
 }
 
+/// Hand memory freed by finished transfers back to the OS.
+///
+/// A transfer churns many buffers across tokio's worker threads. glibc keeps
+/// what they free in per-thread arenas, so after a large download spool sat on
+/// tens of MB it no longer used (an 8-thread churn probe: 29 MB resident with
+/// ~0.25 MB live, 9 MB after a trim). Runs on a blocking thread because the
+/// trim walks every arena.
+pub fn release_free_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    tokio::task::spawn_blocking(|| {
+        // SAFETY: malloc_trim only returns free heap pages to the OS.
+        unsafe { libc::malloc_trim(0) };
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

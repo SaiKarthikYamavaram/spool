@@ -1450,6 +1450,9 @@ fn spawn_transfer(app: AppHandle, state: Arc<AppState>, entry: Download) {
         // A finished transfer frees a slot.
         pump(&app, &state);
         finish_action(&app, &state);
+        if state.active.lock().unwrap().is_empty() {
+            crate::usage::release_free_memory();
+        }
     });
 }
 

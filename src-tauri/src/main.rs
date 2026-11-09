@@ -3,7 +3,15 @@
 
 fn main() {
     #[cfg(target_os = "linux")]
-    pick_webkit_renderer();
+    {
+        pick_webkit_renderer();
+        // Skip JavaScriptCore's top-tier optimizing JIT. The UI's JS is light,
+        // and in a scroll benchmark of this UI the web process held ~9 MB less
+        // anonymous memory (3 runs each) with no measurable CPU change. Inherited by WebKit's child processes.
+        if std::env::var_os("JSC_useDFGJIT").is_none() {
+            std::env::set_var("JSC_useDFGJIT", "0");
+        }
+    }
 
     spool_lib::run()
 }

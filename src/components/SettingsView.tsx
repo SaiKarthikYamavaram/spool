@@ -49,7 +49,7 @@ function Section({
   icon, title, children,
 }: { icon: React.ReactNode; title: string; children: React.ReactNode }) {
   return (
-    <Card className="gap-3 sm:gap-4 border-border/80 bg-card/95 dark:bg-card/60 py-4 sm:py-5 shadow-xs dark:shadow-sm backdrop-blur-sm">
+    <Card className="gap-3 sm:gap-4 border-border/80 bg-card/95 dark:bg-card/60 py-4 sm:py-5 shadow-xs dark:shadow-sm">
       <CardHeader className="px-3.5 sm:px-5">
         <CardTitle className="flex items-center gap-2.5 text-[13px] font-semibold uppercase tracking-wide text-muted-foreground">
           <span className="flex size-7 items-center justify-center rounded-full bg-primary/10 text-primary">

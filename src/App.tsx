@@ -520,10 +520,12 @@ function App() {
       )}
 
       {/* Ambient glow. Purely decorative, so hidden from assistive tech and
-          pinned behind everything else. Gentle pastel sheen in light mode, luminous in dark mode. */}
-      <div aria-hidden="true" className="pointer-events-none fixed -top-40 -left-40 -z-10 size-[28rem] rounded-full bg-primary/8 dark:bg-primary/25 blur-3xl" />
-      <div aria-hidden="true" className="pointer-events-none fixed top-1/3 -right-40 -z-10 size-96 rounded-full bg-violet-500/6 dark:bg-violet-500/20 blur-3xl" />
-      <div aria-hidden="true" className="pointer-events-none fixed -bottom-40 left-1/4 -z-10 size-96 rounded-full bg-fuchsia-500/4 dark:bg-fuchsia-500/10 blur-3xl" />
+          pinned behind everything else. Gentle pastel sheen in light mode, luminous in dark mode.
+          Radial gradients, not blurred circles: WebKitGTK re-runs a 64px blur
+          filter on every repaint, which made progress ticks and scrolling stutter. */}
+      <div aria-hidden="true" className="pointer-events-none fixed -top-48 -left-48 -z-10 size-[32rem] bg-radial from-primary/8 dark:from-primary/25 to-transparent to-70%" />
+      <div aria-hidden="true" className="pointer-events-none fixed top-1/3 -right-48 -z-10 size-[28rem] bg-radial from-violet-500/6 dark:from-violet-500/20 to-transparent to-70%" />
+      <div aria-hidden="true" className="pointer-events-none fixed -bottom-48 left-1/4 -z-10 size-[28rem] bg-radial from-fuchsia-500/4 dark:from-fuchsia-500/10 to-transparent to-70%" />
 
       <Toaster />
       <Titlebar
@@ -629,7 +631,7 @@ function App() {
                 often. Adding is a deliberate act with several answers to give,
                 so it opens the dialog that asks for them. One elevated bar
                 rather than three loose controls floating on the page. */}
-            <div className="mt-3 flex items-center gap-1 rounded-xl border border-border/80 bg-card/90 dark:bg-card/60 p-1.5 shadow-xs dark:shadow-sm backdrop-blur-sm transition-all focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10">
+            <div className="mt-3 flex items-center gap-1 rounded-xl border border-border/80 bg-card/90 dark:bg-card/60 p-1.5 shadow-xs dark:shadow-sm transition-all focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10">
               <div className="relative flex-1 min-w-0">
                 <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
@@ -700,7 +702,7 @@ function App() {
                 starts, rather than a bar of its own that pushes the list
                 down every time selection mode is entered. */}
             {selectMode && (
-              <div className="mt-3 flex min-h-9 flex-wrap items-center justify-between gap-2 rounded-xl border border-border/80 bg-card/90 dark:bg-card/80 px-3 py-1 shadow-xs dark:shadow-sm backdrop-blur-sm">
+              <div className="mt-3 flex min-h-9 flex-wrap items-center justify-between gap-2 rounded-xl border border-border/80 bg-card/90 dark:bg-card/80 px-3 py-1 shadow-xs dark:shadow-sm">
                 <div className="flex items-center gap-2">
                   <Checkbox
                     checked={allVisibleSelected ? true : selectedRows.length > 0 ? "indeterminate" : false}
@@ -977,7 +979,7 @@ const Row = memo(function Row({
   return (
     <Card
       className={cn(
-        "flex-row items-center gap-2.5 sm:gap-3 bg-card/95 dark:bg-card/75 p-2.5 sm:p-3 backdrop-blur-sm transition-all shadow-[0_1px_3px_rgba(0,0,0,0.05),0_1px_2px_rgba(0,0,0,0.02)] border-border/80 hover:-translate-y-0.5 hover:shadow-[0_8px_20px_-4px_rgba(0,0,0,0.08)] dark:hover:shadow-primary/5",
+        "flex-row items-center gap-2.5 sm:gap-3 bg-card/95 dark:bg-card/75 p-2.5 sm:p-3 transition-all shadow-[0_1px_3px_rgba(0,0,0,0.05),0_1px_2px_rgba(0,0,0,0.02)] border-border/80 hover:-translate-y-0.5 hover:shadow-[0_8px_20px_-4px_rgba(0,0,0,0.08)] dark:hover:shadow-primary/5",
         selected ? "border-primary bg-accent/30 dark:bg-accent/40 ring-1 ring-primary/25" : "hover:border-primary/50",
         selectMode && "cursor-pointer",
         isDragging && "opacity-40 scale-[0.99] border-dashed border-primary/60",

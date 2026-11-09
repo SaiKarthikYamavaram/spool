@@ -8,6 +8,7 @@ mod state;
 mod thumbs;
 mod torrent;
 mod throttle;
+mod usage;
 mod ytdlp;
 
 use std::path::Path;
@@ -337,6 +338,12 @@ fn bulk_action(app: AppHandle, state: Shared<'_>, ids: Vec<String>, action: stat
 fn pause_all(app: AppHandle, state: Shared<'_>) {
     state.pause_all();
     state::emit_queue(&app, &state);
+}
+
+/// CPU and memory of spool and its webview, for the performance overlay.
+#[tauri::command]
+fn process_usage() -> usage::Usage {
+    usage::sample()
 }
 
 /// A poster frame for a finished video, as a `data:` URI.
@@ -1079,6 +1086,7 @@ pub fn run() {
             pause_all,
             resume_all,
             video_thumbnail,
+            process_usage,
             get_queue,
             clear_history,
             get_settings,

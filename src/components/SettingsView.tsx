@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  Activity,
   Check,
   Clipboard,
   Clock,
@@ -28,6 +29,7 @@ import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 import { Switch } from "./ui/switch";
+import { setPerfOverlay, usePerfOverlay } from "./PerfOverlay";
 
 const THEME_OPTIONS = [
   { value: "system", label: "System", icon: <Monitor className="size-4" /> },
@@ -70,6 +72,7 @@ export function SettingsView() {
   const [copiedPath, setCopiedPath] = useState(false);
   const debounceTimer = useRef<number | null>(null);
   const latestSettings = useRef<Settings | null>(null);
+  const perfOverlay = usePerfOverlay();
 
   useEffect(() => {
     api.getExtensionStatus().then(setExtStatus).catch(() => {});
@@ -626,6 +629,17 @@ export function SettingsView() {
         <p className="text-sm text-muted-foreground">
           Cookies from a browser let yt-dlp fetch age-restricted or members-only
           videos. Leave blank to use the cookies file above, or nothing.
+        </p>
+      </Section>
+
+      <Section icon={<Activity className="size-3.5" />} title="Performance">
+        <Label className="flex items-center gap-2 font-normal">
+          <Switch checked={perfOverlay} onCheckedChange={setPerfOverlay} />
+          Show FPS, CPU and memory in the corner
+        </Label>
+        <p className="text-sm text-muted-foreground">
+          CPU is a share of one core and covers spool and its web view, so two busy
+          cores read 200%. CPU and memory are shown on Linux only.
         </p>
       </Section>
     </section>

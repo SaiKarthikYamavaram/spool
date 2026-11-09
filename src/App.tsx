@@ -19,6 +19,7 @@ import {
   type Status,
 } from "./lib/api";
 import { SettingsView } from "./components/SettingsView";
+import { PerfOverlay } from "./components/PerfOverlay";
 import { applyTheme } from "./lib/theme";
 import { DetailModal } from "./components/DetailModal";
 import { ConfirmDelete } from "./components/ConfirmDelete";
@@ -528,6 +529,7 @@ function App() {
       <div aria-hidden="true" className="pointer-events-none fixed -bottom-48 left-1/4 -z-10 size-[28rem] bg-radial from-fuchsia-500/4 dark:from-fuchsia-500/10 to-transparent to-70%" />
 
       <Toaster />
+      <PerfOverlay />
       <Titlebar
         onToggleSidebar={() => setSidebarCollapsed((c) => !c)}
         sidebarCollapsed={sidebarCollapsed}

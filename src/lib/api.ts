@@ -187,6 +187,9 @@ export const api = {
   /// A poster frame for a finished video, as a data: URI. Null for anything
   /// that is not a readable video — the row shows its type icon instead.
   videoThumbnail: (id: string) => invoke<string | null>("video_thumbnail", { id }),
+  /// CPU (percent of one core) and resident memory of spool plus its
+  /// webview. CPU is null on the first call and off Linux.
+  processUsage: () => invoke<{ cpu: number | null; rss: number }>("process_usage"),
   getQueue: () => invoke<DownloadView[]>("get_queue"),
   clearHistory: () => invoke<void>("clear_history"),
   getSettings: () => invoke<Settings>("get_settings"),

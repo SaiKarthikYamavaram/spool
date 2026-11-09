@@ -229,9 +229,10 @@ export function AddDialog({
         // Queued one at a time rather than through import_urls, so the folder
         // and the start-now choice apply to every link in the batch.
         const failed: string[] = [];
+        let after: string | null = null;
         for (const link of links) {
           try {
-            await api.addDownload(link, options);
+            after = await api.addDownload(link, { ...options, after });
           } catch {
             failed.push(link);
           }

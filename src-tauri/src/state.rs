@@ -154,6 +154,11 @@ pub struct AddOptions {
     /// BitTorrent: specific file IDs to download.
     #[serde(default)]
     pub only_files: Option<Vec<usize>>,
+    /// Place the new entry right after this one. A batch passes the previous
+    /// link's id so the links stay in the order they were given; otherwise a
+    /// new download goes to the top, where it is also the next to start.
+    #[serde(default)]
+    pub after: Option<String>,
 }
 
 /// What a multi-row selection asks for. Sending the whole selection as one
@@ -716,12 +721,6 @@ impl AppState {
         live.into_iter().map(|(_, request)| request).collect()
     }
 
-    /// Add a URL typed into the app. Uses the manual cookies.txt session, if
-    /// any.
-    pub async fn add(&self, app: &AppHandle, url: &str) -> Result<String, String> {
-        self.add_with_session(app, url, None, false, AddOptions::default()).await
-    }
-
     /// Add a URL, optionally with a session the browser extension captured for
     /// it, and optionally forcing the yt-dlp video engine. The session is
     /// stored on the entry so a later resume replays the same cookie/UA/referer.
@@ -808,9 +807,19 @@ impl AppState {
         if opts.start == Some(false) {
             entry.status = Status::Paused;
         }
-        self.queue.lock().unwrap().push(entry);
+        self.insert_new(entry, opts.after.as_deref());
         self.save_queue();
         Ok(id)
+    }
+
+    /// Newest on top: a new entry goes first, which also makes it the next to
+    /// start, or right after `after` when a batch is keeping its order.
+    fn insert_new(&self, entry: Download, after: Option<&str>) {
+        let mut queue = self.queue.lock().unwrap();
+        let at = after
+            .and_then(|a| queue.iter().position(|d| d.id == a))
+            .map_or(0, |i| i + 1);
+        queue.insert(at, entry);
     }
 
     /// Apply one action to a selection of entries.
@@ -1961,6 +1970,29 @@ mod tests {
             only_files: None,
         };
         state.queue.lock().unwrap().push(Download::new(id.into(), plan));
+    }
+
+    #[test]
+    fn new_downloads_go_on_top_and_a_batch_keeps_its_order() {
+        let state = app();
+        push(&state, "old");
+        let take = |id: &str| {
+            let mut q = state.queue.lock().unwrap();
+            let i = q.iter().position(|d| d.id == id).unwrap();
+            q.remove(i)
+        };
+        // Reuse push to build entries, then re-insert them the way add does.
+        push(&state, "new");
+        let e = take("new");
+        state.insert_new(e, None);
+        push(&state, "b1");
+        let e = take("b1");
+        state.insert_new(e, None);
+        push(&state, "b2");
+        let e = take("b2");
+        state.insert_new(e, Some("b1"));
+        let ids: Vec<_> = state.queue.lock().unwrap().iter().map(|d| d.id.clone()).collect();
+        assert_eq!(ids, ["b1", "b2", "new", "old"]);
     }
 
     fn status_of(state: &AppState, id: &str) -> Status {

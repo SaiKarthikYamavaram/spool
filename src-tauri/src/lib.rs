@@ -121,14 +121,18 @@ async fn import_urls(
     text: String,
 ) -> Result<Vec<String>, String> {
     let mut skipped = Vec::new();
+    // Each link lands after the previous one, so the list keeps file order.
+    let mut after = None;
 
     for line in text.lines() {
         let url = line.trim();
         if url.is_empty() || url.starts_with('#') {
             continue;
         }
-        if let Err(e) = state.add(&app, url).await {
-            skipped.push(format!("{url}: {e}"));
+        let opts = AddOptions { after: after.clone(), ..Default::default() };
+        match state.add_with_session(&app, url, None, false, opts).await {
+            Ok(id) => after = Some(id),
+            Err(e) => skipped.push(format!("{url}: {e}")),
         }
     }
 

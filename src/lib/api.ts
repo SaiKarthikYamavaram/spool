@@ -117,6 +117,9 @@ export type AddOptions = {
   quality?: string | null;
   start?: boolean;
   only_files?: number[] | null;
+  /// Place it right after this download, so a batch keeps its order. Omitted,
+  /// a new download goes to the top of the queue.
+  after?: string | null;
 };
 
 export const api = {

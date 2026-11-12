@@ -5,6 +5,7 @@
 //! validation and single-connection downgrade, pre-allocated seek-writes,
 //! durable checkpoints, and `If-Range` resume.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -107,6 +108,86 @@ fn worth_splitting(left: u64, rate: Option<f64>, setup_secs: f64) -> bool {
 fn median(mut xs: Vec<f64>) -> Option<f64> {
     xs.sort_by(f64::total_cmp);
     xs.get(xs.len() / 2).copied()
+}
+
+/// A connection running below this share of the typical connection's speed
+/// for `SLOW_FOR` is restarted at its current offset. A fresh TCP connection
+/// often lands on a better route, or on a less loaded server behind the same
+/// host, while the stuck one would otherwise set the finish time.
+const SLOW_SHARE: f64 = 0.1;
+const SLOW_FOR: Duration = Duration::from_secs(10);
+const SLOW_TICK: Duration = Duration::from_secs(2);
+/// Restarts per range, so a range that is slow from anywhere (or a server
+/// that answers it with retries) cannot reconnect forever.
+const MAX_RESTARTS: u32 = 3;
+
+/// Watches the live connections of one transfer for a slow straggler.
+#[derive(Default)]
+struct SlowWatch {
+    last: Option<Instant>,
+    /// Median connection speed from the last check that had two or more to
+    /// compare, kept so a lone slow tail is still measured against it.
+    // ponytail: goes stale if the speed limit drops while one connection is
+    // left; MAX_RESTARTS bounds the cost to three reconnects.
+    typical: Option<f64>,
+    seen: HashMap<usize, Watched>,
+}
+
+struct Watched {
+    bytes: u64,
+    /// Bytes/s since the previous check; None on the first sighting.
+    rate: Option<f64>,
+    slow_since: Option<Instant>,
+    restarts: u32,
+}
+
+impl SlowWatch {
+    /// `running` holds (counter, bytes so far, bytes left) for each live
+    /// connection. Returns the counters whose connection should restart.
+    fn check(&mut self, running: &[(usize, u64, u64)], now: Instant) -> Vec<usize> {
+        let secs = self.last.map(|t| now.duration_since(t).as_secs_f64()).filter(|s| *s > 0.0);
+        self.last = Some(now);
+        self.seen.retain(|i, _| running.iter().any(|r| r.0 == *i));
+        for &(i, bytes, _) in running {
+            use std::collections::hash_map::Entry;
+            match self.seen.entry(i) {
+                Entry::Vacant(e) => {
+                    e.insert(Watched { bytes, rate: None, slow_since: None, restarts: 0 });
+                }
+                Entry::Occupied(mut e) => {
+                    let w = e.get_mut();
+                    w.rate = secs.map(|s| bytes.saturating_sub(w.bytes) as f64 / s);
+                    w.bytes = bytes;
+                }
+            }
+        }
+
+        let rates: Vec<f64> = self.seen.values().filter_map(|w| w.rate).collect();
+        if rates.len() >= 2 {
+            self.typical = median(rates);
+        }
+        let Some(typical) = self.typical else { return Vec::new() };
+
+        let mut restart = Vec::new();
+        for &(i, _, left) in running {
+            let w = self.seen.get_mut(&i).expect("inserted above");
+            // Not worth a new handshake for a small tail.
+            let slow = left >= MIN_SPLIT_BYTES
+                && w.restarts < MAX_RESTARTS
+                && w.rate.is_some_and(|r| r < typical * SLOW_SHARE);
+            if !slow {
+                w.slow_since = None;
+                continue;
+            }
+            let since = *w.slow_since.get_or_insert(now);
+            if now.duration_since(since) >= SLOW_FOR {
+                w.slow_since = None;
+                w.restarts += 1;
+                restart.push(i);
+            }
+        }
+        restart
+    }
 }
 
 /// Refuse to start unless this much space remains free beyond the file itself.
@@ -1490,10 +1571,12 @@ async fn stream_range(
     }
 
     let asked = Instant::now();
-    let response = request
-        .send()
-        .await
-        .map_err(|e| SegErr::Retryable(format!("request failed: {e}")))?;
+    // Cancellable while waiting on headers too, so a pause or a slow-connection
+    // restart does not hang on a server that never answers.
+    let response = tokio::select! {
+        _ = token.cancelled() => return Err(SegErr::Cancelled),
+        r = request.send() => r.map_err(|e| SegErr::Retryable(format!("request failed: {e}")))?,
+    };
     done.note_ttfb(asked.elapsed());
 
     let status = response.status();
@@ -1736,8 +1819,12 @@ async fn transfer(
     progress.set_layout(&ranges);
 
     // Each task reports which counter it ran, so a dropped one's range can be
-    // handed to another connection.
-    let spawn = |tasks: &mut tokio::task::JoinSet<(usize, Result<(), SegErr>)>, i: usize| {
+    // handed to another connection. `live` keeps each running connection's
+    // own token, so the slow watch can restart just that one.
+    let spawn = |tasks: &mut tokio::task::JoinSet<(usize, Result<(), SegErr>)>,
+                 live: &mut HashMap<usize, CancellationToken>,
+                 i: usize| {
+        let own = segment_token.child_token();
         let segment = run_segment(
             segment_client.clone(),
             url.clone(),
@@ -1745,55 +1832,92 @@ async fn transfer(
             info.validator.clone(),
             progress.counter(i),
             throttle.clone(),
-            segment_token.child_token(),
+            own.clone(),
         );
+        live.insert(i, own);
         tasks.spawn(async move { (i, segment.await) });
     };
     let mut tasks = tokio::task::JoinSet::new();
+    let mut live = HashMap::new();
     for i in 0..ranges.len() {
-        spawn(&mut tasks, i);
+        spawn(&mut tasks, &mut live, i);
     }
+    let mut watch = SlowWatch::default();
+    let mut tick = tokio::time::interval(SLOW_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut first_error: Option<String> = None;
     // Counters whose connection was dropped, still holding unfetched bytes.
     // Nothing writes to them until a finishing connection adopts one.
     let mut orphans: Vec<usize> = Vec::new();
     let mut last_drop: Option<String> = None;
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
+    loop {
+        let joined = tokio::select! {
+            joined = tasks.join_next() => match joined {
+                Some(joined) => joined,
+                None => break,
+            },
+            _ = tick.tick() => {
+                let running: Vec<_> = live
+                    .keys()
+                    .map(|&i| {
+                        let c = progress.counter(i);
+                        (i, c.live(), c.remaining())
+                    })
+                    .collect();
+                for i in watch.check(&running, Instant::now()) {
+                    live[&i].cancel();
+                }
+                continue;
+            }
+        };
+        let (i, result) = match joined {
+            Ok(joined) => joined,
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(format!("segment task failed: {e}"));
+                }
+                segment_token.cancel();
+                continue;
+            }
+        };
+        // Cancelled on its own while the download was not: the slow watch
+        // restarted it.
+        let restarted = live.remove(&i).is_some_and(|own| own.is_cancelled()) && !segment_token.is_cancelled();
+        match result {
             // A connection just freed up. It first adopts a dropped range,
             // since nobody else will fetch it. Otherwise, rather than idle
             // while the slowest segment crawls to the finish, it takes half of
             // whatever range has the most left, so the tail no longer
             // dictates the finish time.
-            Ok((_, Ok(()))) => {
+            Ok(()) => {
                 if !segment_token.is_cancelled() {
                     if let Some(i) = orphans.pop().or_else(|| progress.split_largest()) {
-                        spawn(&mut tasks, i);
+                        spawn(&mut tasks, &mut live, i);
                     }
                 }
+            }
+            // Its bytes were synced on the way out; a new connection picks up
+            // at the same offset.
+            Err(SegErr::Cancelled) if restarted => {
+                eprintln!("spool: restarting a slow connection");
+                spawn(&mut tasks, &mut live, i);
             }
             // The other connections carry on; this range waits for one of
             // them to finish. If none is left, the loop ends with it still
             // orphaned and the download fails below.
-            Ok((i, Err(SegErr::Dropped(m)))) => {
+            Err(SegErr::Dropped(m)) => {
                 eprintln!("spool: dropped a connection, its range will be reassigned: {m}");
                 orphans.push(i);
                 last_drop = Some(m);
             }
-            Ok((_, Err(SegErr::RangeIgnored))) => {
+            Err(SegErr::RangeIgnored) => {
                 range_ignored.store(true, Ordering::Relaxed);
                 segment_token.cancel();
             }
-            Ok((_, Err(e))) => {
+            Err(e) => {
                 if first_error.is_none() && !matches!(e, SegErr::Cancelled) {
                     first_error = Some(e.message());
-                }
-                segment_token.cancel();
-            }
-            Err(e) => {
-                if first_error.is_none() {
-                    first_error = Some(format!("segment task failed: {e}"));
                 }
                 segment_token.cancel();
             }
@@ -2575,7 +2699,7 @@ mod tests {
     ///
     /// At most `limit` bodies are served at once; extra requests get `403`,
     /// the way servers that cap connections per IP answer them.
-    async fn serve_pattern(listener: tokio::net::TcpListener, total: u64, limit: usize) {
+    async fn serve_pattern(listener: tokio::net::TcpListener, total: u64, limit: usize, pace: fn(u64) -> Duration) {
         use std::sync::atomic::AtomicUsize;
         use tokio::io::{AsyncBufReadExt, BufReader};
         const HEAD: &str = "Accept-Ranges: bytes\r\nETag: \"v1\"\r\nConnection: close\r\n";
@@ -2640,12 +2764,76 @@ mod tests {
                         return; // client dropped a shrunk segment's connection
                     }
                     at += n;
-                    if start == 0 {
-                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    let wait = pace(start);
+                    if !wait.is_zero() {
+                        tokio::time::sleep(wait).await;
                     }
                 }
             });
         }
+    }
+
+    /// Pacing for `serve_pattern`: the connection asking from byte 0 trickles,
+    /// so the other segments finish first and the split kicks in.
+    fn slow_head(start: u64) -> Duration {
+        if start == 0 { Duration::from_millis(20) } else { Duration::ZERO }
+    }
+
+    #[test]
+    fn slow_watch_restarts_only_a_lasting_straggler() {
+        let mut watch = SlowWatch::default();
+        let t0 = Instant::now();
+        let left = 64 * MIN_SPLIT_BYTES;
+        for s in (0..=16).step_by(2) {
+            // Connection 0 runs at 10 KB/s, the other two at 1 MB/s.
+            let running = [(0, s * 10_000, left), (1, s * 1_000_000, left), (2, s * 1_000_000, left)];
+            let restart = watch.check(&running, t0 + Duration::from_secs(s));
+            // First measured slow at 2 s, so due at 12 s, then a fresh grace.
+            let expect: Vec<usize> = if s == 12 { vec![0] } else { vec![] };
+            assert_eq!(restart, expect, "at {s}s");
+        }
+
+        // Everyone equally slow is the link, not a bad connection.
+        let mut watch = SlowWatch::default();
+        for s in (0..=30).step_by(2) {
+            let running = [(0, s * 10_000, left), (1, s * 10_000, left)];
+            assert!(watch.check(&running, t0 + Duration::from_secs(s)).is_empty());
+        }
+    }
+
+    /// A connection stuck far below the others is reconnected at its offset
+    /// rather than left to set the finish time. Without the restart the last
+    /// ~2 MB of segment 0 would trickle in at 16 KB/s for about two minutes.
+    #[tokio::test]
+    async fn a_stuck_connection_is_restarted() {
+        fn stuck_head(start: u64) -> Duration {
+            if start == 0 { Duration::from_secs(4) } else { Duration::from_millis(50) }
+        }
+        let total: u64 = 32 * 1024 * 1024;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/stuck.bin", listener.local_addr().unwrap());
+        tokio::spawn(serve_pattern(listener, total, usize::MAX, stuck_head));
+
+        let dir = scratch("stuck");
+        let (client, seg) = clients();
+        let plan = prepare(&client, &url, &dir, 4, false, None).await.unwrap();
+        assert_eq!(plan.ranges.len(), 4, "expected a segmented plan");
+
+        let began = Instant::now();
+        let progress = Progress::new(plan.segment_count());
+        let path = run(&client, &seg, &plan, &progress, &Throttle::unlimited(), CancellationToken::new(), |_, _| {})
+            .await
+            .unwrap();
+        let took = began.elapsed();
+        assert!(took < Duration::from_secs(40), "stuck connection was not restarted: took {took:?}");
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len() as u64, total);
+        assert!(
+            bytes.iter().enumerate().all(|(i, &b)| b == (i % 251) as u8),
+            "every byte where it belongs"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     /// The slowest connection must not decide the finish time. Served locally
@@ -2656,7 +2844,7 @@ mod tests {
         let total: u64 = 16 * 1024 * 1024;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/pattern.bin", listener.local_addr().unwrap());
-        tokio::spawn(serve_pattern(listener, total, usize::MAX));
+        tokio::spawn(serve_pattern(listener, total, usize::MAX, slow_head));
 
         let dir = scratch("split");
         let (client, seg) = clients();
@@ -2690,7 +2878,7 @@ mod tests {
         let total: u64 = 16 * 1024 * 1024;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/capped.bin", listener.local_addr().unwrap());
-        tokio::spawn(serve_pattern(listener, total, 2));
+        tokio::spawn(serve_pattern(listener, total, 2, slow_head));
 
         let dir = scratch("capped");
         let (client, seg) = clients();
@@ -2720,7 +2908,7 @@ mod tests {
         let half = total / 2;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/small.bin", listener.local_addr().unwrap());
-        tokio::spawn(serve_pattern(listener, total, usize::MAX));
+        tokio::spawn(serve_pattern(listener, total, usize::MAX, slow_head));
 
         let dir = scratch("single-resume");
         let (client, seg) = clients();
@@ -2754,7 +2942,7 @@ mod tests {
         let total: u64 = 2 * 1024 * 1024;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/slow.bin", listener.local_addr().unwrap());
-        tokio::spawn(serve_pattern(listener, total, usize::MAX));
+        tokio::spawn(serve_pattern(listener, total, usize::MAX, slow_head));
 
         let dir = scratch("pause-durable");
         let (client, seg) = clients();

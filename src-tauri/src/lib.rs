@@ -950,7 +950,10 @@ pub fn run() {
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     interval.tick().await;
-                    flush_state.flush_if_dirty();
+                    // The save ends in an fsync; keep it off the async workers
+                    // that are streaming downloads.
+                    let state = Arc::clone(&flush_state);
+                    let _ = tokio::task::spawn_blocking(move || state.flush_if_dirty()).await;
                 }
             });
 

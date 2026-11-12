@@ -286,6 +286,12 @@ pub struct AppState {
     torrent: tokio::sync::OnceCell<Arc<librqbit::Session>>,
     /// Live or recently active torrent handles, keyed by download id.
     torrent_handles: Mutex<HashMap<String, crate::torrent::ManagedTorrentHandle>>,
+    /// Client pairs by session, so downloads from the same host reuse warm
+    /// connections, and a download reuses the one its probe opened.
+    clients: Mutex<HashMap<Session, (Client, Client)>>,
+    /// `save_json` writes through one fixed `.tmp` name, so two saves at once
+    /// could rename the other's half-written file into place.
+    save_lock: Mutex<()>,
     data_dir: PathBuf,
     config_dir: PathBuf,
 }
@@ -323,6 +329,8 @@ impl AppState {
             pending: Mutex::new(HashMap::new()),
             dirty: std::sync::atomic::AtomicBool::new(false),
             last_extension_ping: AtomicU64::new(0),
+            clients: Mutex::new(HashMap::new()),
+            save_lock: Mutex::new(()),
             data_dir,
             config_dir,
         })
@@ -372,13 +380,21 @@ impl AppState {
         session
     }
 
-    /// Build a client pair from a session. Built per download rather than
-    /// shared, because `Cookie` and `Referer` are host-specific.
+    /// The client pair for a session. Keyed by the whole session, because
+    /// `Cookie` and `Referer` are host-specific; a client is a cheap handle
+    /// onto its connection pool, so returning clones shares the pool.
     pub fn clients_for(&self, session: &Session) -> Result<(Client, Client), String> {
-        Ok((
-            download::build_client(session)?,
-            download::build_segment_client(session)?,
-        ))
+        let mut cache = self.clients.lock().unwrap();
+        if let Some(pair) = cache.get(session) {
+            return Ok(pair.clone());
+        }
+        // ponytail: wipe-all bound; an LRU only if sessions churn that much.
+        if cache.len() >= 32 {
+            cache.clear();
+        }
+        let pair = (download::build_client(session)?, download::build_segment_client(session)?);
+        cache.insert(session.clone(), pair.clone());
+        Ok(pair)
     }
 
     pub fn settings(&self) -> Settings {
@@ -672,11 +688,17 @@ impl AppState {
         }
     }
 
-    pub fn save_queue(&self) {
+    /// Returns whether the write landed (failures are logged).
+    pub fn save_queue(&self) -> bool {
+        // Snapshot under the lock too, so a newer queue is never overwritten
+        // by an older one.
+        let _saving = self.save_lock.lock().unwrap();
         let snapshot = self.queue.lock().unwrap().clone();
-        if let Err(e) = queue::save_json(&self.data_dir.join("queue.json"), &snapshot) {
+        let saved = queue::save_json(&self.data_dir.join("queue.json"), &snapshot);
+        if let Err(e) = &saved {
             eprintln!("spool: could not save queue: {e}");
         }
+        saved.is_ok()
     }
 
     fn save_settings(&self) {
@@ -790,7 +812,9 @@ impl AppState {
         } else if crate::ftp::is_ftp_url(url) {
             crate::ftp::prepare(url, &session, &dir, categorize, custom_name).await?
         } else {
-            let (client, _) = self.clients_for(&session)?;
+            // Probe on the segment client, so its kept-alive connection is
+            // the first segment's when the download starts.
+            let (_, client) = self.clients_for(&session)?;
             download::prepare(&client, url, &dir, settings.segments, categorize, custom_name).await?
         };
 
@@ -1019,7 +1043,7 @@ impl AppState {
 
         match plan.engine {
             download::Engine::Http => {
-                let (client, _) = self.clients_for(&session)?;
+                let (_, client) = self.clients_for(&session)?;
                 let url = download::validate_url(&plan.url)?;
                 let info = download::probe(&client, &url).await?;
                 if let (Some(total), Some(dir)) = (info.total, plan.final_path.parent()) {
@@ -1951,6 +1975,23 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("spool-state-{}", uid()));
         std::fs::create_dir_all(&dir).unwrap();
         AppState::new(dir.clone(), dir).unwrap()
+    }
+
+    /// Command handlers and the flusher save from different threads. Each
+    /// save must land whole, never as another's half-written `.tmp`.
+    #[test]
+    fn concurrent_saves_keep_the_queue_readable() {
+        let state = app();
+        for i in 0..50 {
+            push(&state, &i.to_string());
+        }
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| assert!((0..40).all(|_| state.save_queue()), "a save was lost to another"));
+            }
+        });
+        let saved = queue::load_queue(&state.data_dir.join("queue.json"));
+        assert_eq!(saved.len(), 50, "queue.json must parse after racing saves");
     }
 
     fn uid() -> u64 {

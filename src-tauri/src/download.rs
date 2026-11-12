@@ -208,7 +208,7 @@ const MAX_REDIRECTS: usize = 10;
 /// cookie is bound to the `User-Agent` and `Referer` that earned it, all three
 /// travel together. A default session (no cookie, no referer) is the ordinary
 /// case for links that need no authentication.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Session {
     pub user_agent: String,
     pub cookie: Option<String>,
@@ -1769,6 +1769,22 @@ async fn stream_whole_once(
 }
 
 
+/// Reserve `total` bytes for the `.part`. exFAT, NTFS-3g and other FUSE
+/// filesystems have no `fallocate` and refuse it, which used to fail the
+/// download outright; there, settle for setting the length. Free space was
+/// already checked before the download started.
+async fn reserve(file: &File, total: u64) -> std::io::Result<()> {
+    match file.allocate(total).await {
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            if file.metadata().await?.len() < total {
+                file.set_len(total).await?;
+            }
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 /// Pick a strategy and run it, returning the byte count actually written.
 #[allow(clippy::too_many_arguments)]
 async fn transfer(
@@ -1805,7 +1821,7 @@ async fn transfer(
         .open(part)
         .await
         .map_err(|e| format!("cannot open {}: {e}", part.display()))?;
-    file.allocate(total)
+    reserve(&file, total)
         .await
         .map_err(|e| format!("cannot reserve {} on disk: {e}", human_bytes(total)))?;
     file.sync_all().await.map_err(|e| format!("sync failed: {e}"))?;

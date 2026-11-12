@@ -17,7 +17,7 @@ use reqwest::header::{
 };
 use reqwest::{Client, StatusCode, Url};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio_util::sync::CancellationToken;
 
 use crate::throttle::Throttle;
@@ -41,9 +41,39 @@ pub const BACKOFF_SECS: [u64; 5] = [2, 5, 10, 20, 30];
 /// reset. The budget is per stall episode, not per download lifetime.
 pub const RETRY_RESET_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Checkpoint cadence. Each checkpoint costs an `fdatasync`, so this trades a
-/// bounded amount of re-downloaded data against write throughput.
+/// Checkpoint cadence. Each checkpoint costs an `fdatasync` that the segment
+/// waits on before reading its socket again, so a checkpoint needs both this
+/// many new bytes and `CHECKPOINT_INTERVAL` since the last one. Byte-only
+/// cadence meant ~12 syncs a second at 100 MB/s over 8 connections, most of
+/// them wasted: `queue.json`, the only reader of the durable offsets, is
+/// itself written every 2 s. A crash re-downloads at most that much.
 pub const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
+pub const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Per-connection write buffer. `tokio::fs::File` hands every write to the
+/// blocking pool as its own job, so writing each 8-64 KB network chunk
+/// directly cost one thread hop per chunk. Bounded memory: 8 connections x 3
+/// downloads is 12 MB at most.
+const WRITE_BUFFER: usize = 512 * 1024;
+
+fn checkpoint_due(since_bytes: u64, last: Instant) -> bool {
+    since_bytes >= CHECKPOINT_BYTES && last.elapsed() >= CHECKPOINT_INTERVAL
+}
+
+/// Push buffered bytes to the kernel, `fdatasync`, and only then let the
+/// durable counter catch up. `flush` alone reaches the page cache, not the
+/// device: advancing `durable` before the sync returns would let a power cut
+/// leave the recorded offset past bytes that never landed, and resume would
+/// seek over a zero-filled hole.
+async fn checkpoint(file: &mut BufWriter<File>, done: &SegmentProgress) -> Result<(), SegErr> {
+    file.flush().await.map_err(|e| SegErr::Fatal(format!("write failed: {e}")))?;
+    file.get_ref()
+        .sync_data()
+        .await
+        .map_err(|e| SegErr::Fatal(format!("sync failed: {e}")))?;
+    done.commit();
+    Ok(())
+}
 
 /// Below this, the extra sockets cost more than they gain.
 pub const MIN_SEGMENTED_SIZE: u64 = 4 * 1024 * 1024;
@@ -1480,63 +1510,66 @@ async fn stream_range(
         .await
         .map_err(|e| SegErr::Fatal(format!("seek failed: {e}")))?;
 
+    let mut file = BufWriter::with_capacity(WRITE_BUFFER, file);
     let mut stream = response.bytes_stream();
     let mut since_checkpoint = 0u64;
+    let mut last_checkpoint = Instant::now();
 
-    loop {
-        let next = tokio::select! {
-            _ = token.cancelled() => return Err(SegErr::Cancelled),
-            r = tokio::time::timeout(CHUNK_TIMEOUT, stream.next()) => r,
-        };
+    // Every exit but a disk error goes through the checkpoint after this
+    // block, so a pause or a dropped connection keeps everything received so
+    // far instead of rewinding to the last periodic sync.
+    let outcome: Result<(), SegErr> = async {
+        loop {
+            let next = tokio::select! {
+                _ = token.cancelled() => return Err(SegErr::Cancelled),
+                r = tokio::time::timeout(CHUNK_TIMEOUT, stream.next()) => r,
+            };
 
-        let next = next.map_err(|_| SegErr::Retryable("connection stalled: no data for 30s".into()))?;
-        let Some(chunk) = next else { break };
-        let chunk = chunk.map_err(|e| SegErr::Retryable(format!("transfer failed: {e}")))?;
+            let next = next.map_err(|_| SegErr::Retryable("connection stalled: no data for 30s".into()))?;
+            let Some(chunk) = next else { break };
+            let chunk = chunk.map_err(|e| SegErr::Retryable(format!("transfer failed: {e}")))?;
 
-        // Claim before writing: if another connection took over our tail, the
-        // part of this chunk past the new end belongs to it and is dropped.
-        let n = done.claim(chunk.len());
-        if n == 0 {
-            break;
-        }
+            // Claim before writing: if another connection took over our tail,
+            // the part of this chunk past the new end belongs to it and is
+            // dropped.
+            let n = done.claim(chunk.len());
+            if n == 0 {
+                break;
+            }
 
-        // Spend bandwidth budget before writing. Stays cancellable so a pause
-        // does not hang waiting on permits.
-        tokio::select! {
-            _ = token.cancelled() => return Err(SegErr::Cancelled),
-            _ = throttle.take(n) => {}
-        }
+            // Spend bandwidth budget before writing. Stays cancellable so a
+            // pause does not hang waiting on permits.
+            tokio::select! {
+                _ = token.cancelled() => return Err(SegErr::Cancelled),
+                _ = throttle.take(n) => {}
+            }
 
-        file.write_all(&chunk[..n])
-            .await
-            .map_err(|e| SegErr::Fatal(format!("write failed: {e}")))?;
-
-        done.add(n as u64);
-        since_checkpoint += n as u64;
-
-        // Durability checkpoint. `flush` alone only reaches the OS page cache,
-        // so the durable counter must not advance until an actual fdatasync
-        // has returned — otherwise a power cut leaves the recorded offset
-        // pointing at bytes that never made it to the device, and resume seeks
-        // past a zero-filled hole.
-        if since_checkpoint >= CHECKPOINT_BYTES {
-            file.sync_data()
+            file.write_all(&chunk[..n])
                 .await
-                .map_err(|e| SegErr::Fatal(format!("sync failed: {e}")))?;
-            done.commit();
-            since_checkpoint = 0;
-        }
+                .map_err(|e| SegErr::Fatal(format!("write failed: {e}")))?;
 
-        if n < chunk.len() {
-            break;
+            done.add(n as u64);
+            since_checkpoint += n as u64;
+
+            if checkpoint_due(since_checkpoint, last_checkpoint) {
+                checkpoint(&mut file, done).await?;
+                since_checkpoint = 0;
+                last_checkpoint = Instant::now();
+            }
+
+            if n < chunk.len() {
+                break;
+            }
         }
+        Ok(())
     }
+    .await;
 
-    file.sync_data()
-        .await
-        .map_err(|e| SegErr::Fatal(format!("sync failed: {e}")))?;
-    done.commit();
-    Ok(())
+    if matches!(outcome, Err(SegErr::Fatal(_))) {
+        return outcome;
+    }
+    checkpoint(&mut file, done).await?;
+    outcome
 }
 
 /// Single-connection transfer from byte 0. Used when the server has no range
@@ -1598,13 +1631,15 @@ async fn stream_whole_once(
         return Err(SegErr::Fatal(describe_http_error(status, response.headers())));
     }
 
-    let mut file = File::create(path)
+    let file = File::create(path)
         .await
         .map_err(|e| SegErr::Fatal(format!("cannot create {}: {e}", path.display())))?;
+    let mut file = BufWriter::with_capacity(WRITE_BUFFER, file);
 
     let mut stream = response.bytes_stream();
     let mut written = 0u64;
     let mut since_checkpoint = 0u64;
+    let mut last_checkpoint = Instant::now();
 
     loop {
         let next = tokio::select! {
@@ -1629,15 +1664,14 @@ async fn stream_whole_once(
         done.add(chunk.len() as u64);
         since_checkpoint += chunk.len() as u64;
 
-        if since_checkpoint >= CHECKPOINT_BYTES {
-            file.sync_data().await.map_err(|e| SegErr::Fatal(format!("sync failed: {e}")))?;
-            done.commit();
+        if checkpoint_due(since_checkpoint, last_checkpoint) {
+            checkpoint(&mut file, done).await?;
             since_checkpoint = 0;
+            last_checkpoint = Instant::now();
         }
     }
 
-    file.sync_data().await.map_err(|e| SegErr::Fatal(format!("sync failed: {e}")))?;
-    done.commit();
+    checkpoint(&mut file, done).await?;
     Ok(written)
 }
 
@@ -2618,6 +2652,43 @@ mod tests {
             "resumed tail lands at the right offset"
         );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A pause must keep every byte already received. With writes buffered
+    /// and syncs spaced out, a cancel that skipped the final checkpoint would
+    /// drop the buffer and leave the durable offset seconds behind.
+    #[tokio::test]
+    async fn pause_keeps_every_received_byte() {
+        // Served slowly from byte 0 (~3 MB/s), so the cancel lands mid-transfer.
+        let total: u64 = 2 * 1024 * 1024;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/slow.bin", listener.local_addr().unwrap());
+        tokio::spawn(serve_pattern(listener, total));
+
+        let dir = scratch("pause-durable");
+        let (client, seg) = clients();
+        let plan = prepare(&client, &url, &dir, 8, false, None).await.unwrap();
+        assert_eq!(plan.ranges.len(), 1);
+
+        let token = CancellationToken::new();
+        let child = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            child.cancel();
+        });
+        let progress = Progress::new(plan.segment_count());
+        let result = run(&client, &seg, &plan, &progress, &Throttle::unlimited(), token, |_, _| {}).await;
+        assert!(result.is_err(), "cancelled run must not succeed");
+
+        let durable = progress.snapshot()[0];
+        assert!(durable > 0 && durable < total, "cancel should land mid-transfer, got {durable}");
+        assert_eq!(durable, progress.total(), "received bytes were not made durable");
+        let bytes = std::fs::read(&plan.part_path).unwrap();
+        assert!(
+            bytes[..durable as usize].iter().enumerate().all(|(i, &b)| b == (i % 251) as u8),
+            "durable prefix must be on disk"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -53,7 +53,7 @@ pub const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
 /// Per-connection write buffer. `tokio::fs::File` hands every write to the
 /// blocking pool as its own job, so writing each 8-64 KB network chunk
 /// directly cost one thread hop per chunk. Bounded memory: 8 connections x 3
-/// downloads is 12 MB at most.
+/// downloads is 12 MB; the 16-connection maximum doubles that.
 const WRITE_BUFFER: usize = 512 * 1024;
 
 fn checkpoint_due(since_bytes: u64, last: Instant) -> bool {
@@ -79,7 +79,10 @@ async fn checkpoint(file: &mut BufWriter<File>, done: &SegmentProgress) -> Resul
 pub const MIN_SEGMENTED_SIZE: u64 = 4 * 1024 * 1024;
 
 pub const DEFAULT_SEGMENTS: u32 = 8;
-pub const MAX_SEGMENTS: u32 = 8;
+/// Servers that cap speed per connection, and long fat links where one TCP
+/// window cannot fill the pipe, keep gaining past 8. The default stays 8:
+/// more sockets are also more ways to trip a per-IP connection limit.
+pub const MAX_SEGMENTS: u32 = 16;
 
 /// A finished connection takes over half of the largest unfinished range, but
 /// only when each half is at least this big: a fresh connection's handshake
@@ -749,7 +752,7 @@ pub fn plan_segments(total: u64, segments: u32) -> Vec<(u64, u64)> {
     let n = if total < MIN_SEGMENTED_SIZE {
         1
     } else {
-        segments.clamp(1, MAX_SEGMENTS).min(total as u32).max(1)
+        segments.clamp(1, MAX_SEGMENTS)
     } as u64;
 
     let per = total / n;
@@ -2062,6 +2065,10 @@ mod tests {
         assert!(plan_segments(0, 8).is_empty());
         // Never more segments than the cap.
         assert_eq!(plan_segments(100 * 1024 * 1024, 99).len(), MAX_SEGMENTS as usize);
+        // Sizes past 4 GiB must not wrap through u32: a 4 GiB file once
+        // planned as a single connection.
+        assert_eq!(plan_segments(4 << 30, 8).len(), 8);
+        assert_eq!(plan_segments((4 << 30) + 3, 16).len(), 16);
     }
 
     /// `set_len` would pass every assertion here except the last one: a sparse

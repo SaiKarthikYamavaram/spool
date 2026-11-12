@@ -204,11 +204,11 @@ export function SettingsView() {
             <Input
               type="number"
               min={1}
-              max={8}
+              max={16}
               value={settings.segments}
               onChange={(e) =>
                 update({
-                  segments: Math.min(8, Math.max(1, Number(e.currentTarget.value) || 1)),
+                  segments: Math.min(16, Math.max(1, Number(e.currentTarget.value) || 1)),
                 })
               }
             />

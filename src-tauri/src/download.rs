@@ -1655,9 +1655,11 @@ async fn transfer(
     throttle: &Throttle,
     token: &CancellationToken,
 ) -> Result<u64, String> {
-    // No size, no range support, or a file too small to be worth splitting:
-    // one connection, streamed to EOF.
-    if ranges.len() <= 1 {
+    // No size or no range support: one connection, streamed to EOF from byte
+    // 0. A single *range* (small file, or segments set to 1) still goes
+    // through the ranged path below, so a pause or retry resumes at the saved
+    // offset instead of truncating the `.part` and starting over.
+    if ranges.is_empty() {
         return stream_whole(client, url, part, progress, throttle, token).await;
     }
 
@@ -2580,6 +2582,40 @@ mod tests {
         assert!(
             bytes.iter().enumerate().all(|(i, &b)| b == (i % 251) as u8),
             "every byte where it belongs"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A one-range plan (file below the segmentation threshold, or segments
+    /// set to 1) must resume at its saved offset. It used to go down the
+    /// whole-file path, which truncated the `.part` and fetched from byte 0.
+    #[tokio::test]
+    async fn single_range_download_resumes_instead_of_restarting() {
+        let total: u64 = 1024 * 1024;
+        let half = total / 2;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/small.bin", listener.local_addr().unwrap());
+        tokio::spawn(serve_pattern(listener, total));
+
+        let dir = scratch("single-resume");
+        let (client, seg) = clients();
+        let plan = prepare(&client, &url, &dir, 8, false, None).await.unwrap();
+        assert_eq!(plan.ranges.len(), 1, "expected a single-range plan");
+
+        // A marker the server never sends: if the resume re-fetched the first
+        // half, these bytes would be overwritten with the pattern.
+        std::fs::write(&plan.part_path, vec![0xFFu8; half as usize]).unwrap();
+        let progress = Progress::resumed(&[half]);
+        let path = run(&client, &seg, &plan, &progress, &Throttle::unlimited(), CancellationToken::new(), |_, _| {})
+            .await
+            .unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len() as u64, total);
+        assert!(bytes[..half as usize].iter().all(|&b| b == 0xFF), "saved bytes were re-downloaded");
+        assert!(
+            bytes.iter().enumerate().skip(half as usize).all(|(i, &b)| b == (i % 251) as u8),
+            "resumed tail lands at the right offset"
         );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }

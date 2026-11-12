@@ -772,6 +772,12 @@ enum SegErr {
     Retryable(String),
     /// Permanent: no amount of retrying will help.
     Fatal(String),
+    /// This connection cannot go on, but the range is still good for another
+    /// one: the server refused it outright (servers that cap connections per
+    /// IP answer the extras with 403/429/503) or it used up its retries.
+    /// Fails the download only once no other connection is left to take the
+    /// range over.
+    Dropped(String),
     /// The server answered a ranged request with `200 OK`, meaning it ignored
     /// `Range` entirely and is streaming the whole file from byte 0. Writing
     /// that stream at a segment offset would corrupt the file.
@@ -782,7 +788,7 @@ enum SegErr {
 impl SegErr {
     fn message(&self) -> String {
         match self {
-            SegErr::Retryable(m) | SegErr::Fatal(m) => m.clone(),
+            SegErr::Retryable(m) | SegErr::Fatal(m) | SegErr::Dropped(m) => m.clone(),
             SegErr::RangeIgnored => "server ignored Range header".into(),
             SegErr::Cancelled => "cancelled".into(),
         }
@@ -1423,6 +1429,7 @@ async fn run_segment(
             Ok(()) => return Ok(()),
             Err(SegErr::Cancelled) => return Err(SegErr::Cancelled),
             Err(SegErr::Fatal(m)) => return Err(SegErr::Fatal(m)),
+            Err(SegErr::Dropped(m)) => return Err(SegErr::Dropped(m)),
             Err(SegErr::RangeIgnored) => return Err(SegErr::RangeIgnored),
             Err(SegErr::Retryable(m)) => {
                 // The failed attempt may have left unsynced bytes in flight.
@@ -1438,7 +1445,7 @@ async fn run_segment(
                 }
 
                 if attempt >= BACKOFF_SECS.len() {
-                    return Err(SegErr::Fatal(format!(
+                    return Err(SegErr::Dropped(format!(
                         "giving up after {} retries: {m}",
                         BACKOFF_SECS.len()
                     )));
@@ -1498,7 +1505,7 @@ async fn stream_range(
         if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
             return Err(SegErr::Retryable(format!("server returned {status}")));
         }
-        return Err(SegErr::Fatal(describe_http_error(status, response.headers())));
+        return Err(SegErr::Dropped(describe_http_error(status, response.headers())));
     }
 
     let mut file = OpenOptions::new()
@@ -1725,8 +1732,10 @@ async fn transfer(
     let range_ignored = Arc::new(AtomicBool::new(false));
     progress.set_layout(&ranges);
 
-    let spawn = |tasks: &mut tokio::task::JoinSet<Result<(), SegErr>>, i: usize| {
-        tasks.spawn(run_segment(
+    // Each task reports which counter it ran, so a dropped one's range can be
+    // handed to another connection.
+    let spawn = |tasks: &mut tokio::task::JoinSet<(usize, Result<(), SegErr>)>, i: usize| {
+        let segment = run_segment(
             segment_client.clone(),
             url.clone(),
             part.to_path_buf(),
@@ -1734,7 +1743,8 @@ async fn transfer(
             progress.counter(i),
             throttle.clone(),
             segment_token.child_token(),
-        ));
+        );
+        tasks.spawn(async move { (i, segment.await) });
     };
     let mut tasks = tokio::task::JoinSet::new();
     for i in 0..ranges.len() {
@@ -1742,23 +1752,37 @@ async fn transfer(
     }
 
     let mut first_error: Option<String> = None;
+    // Counters whose connection was dropped, still holding unfetched bytes.
+    // Nothing writes to them until a finishing connection adopts one.
+    let mut orphans: Vec<usize> = Vec::new();
+    let mut last_drop: Option<String> = None;
     while let Some(joined) = tasks.join_next().await {
         match joined {
-            // A connection just freed up. Rather than idle while the slowest
-            // segment crawls to the finish, it takes half of whatever range has
-            // the most left, so the tail no longer dictates the finish time.
-            Ok(Ok(())) => {
+            // A connection just freed up. It first adopts a dropped range,
+            // since nobody else will fetch it. Otherwise, rather than idle
+            // while the slowest segment crawls to the finish, it takes half of
+            // whatever range has the most left, so the tail no longer
+            // dictates the finish time.
+            Ok((_, Ok(()))) => {
                 if !segment_token.is_cancelled() {
-                    if let Some(i) = progress.split_largest() {
+                    if let Some(i) = orphans.pop().or_else(|| progress.split_largest()) {
                         spawn(&mut tasks, i);
                     }
                 }
             }
-            Ok(Err(SegErr::RangeIgnored)) => {
+            // The other connections carry on; this range waits for one of
+            // them to finish. If none is left, the loop ends with it still
+            // orphaned and the download fails below.
+            Ok((i, Err(SegErr::Dropped(m)))) => {
+                eprintln!("spool: dropped a connection, its range will be reassigned: {m}");
+                orphans.push(i);
+                last_drop = Some(m);
+            }
+            Ok((_, Err(SegErr::RangeIgnored))) => {
                 range_ignored.store(true, Ordering::Relaxed);
                 segment_token.cancel();
             }
-            Ok(Err(e)) => {
+            Ok((_, Err(e))) => {
                 if first_error.is_none() && !matches!(e, SegErr::Cancelled) {
                     first_error = Some(e.message());
                 }
@@ -1788,6 +1812,9 @@ async fn transfer(
     }
     if token.is_cancelled() {
         return Err("cancelled".into());
+    }
+    if !orphans.is_empty() {
+        return Err(last_drop.unwrap_or_else(|| "every connection was dropped".into()));
     }
 
     Ok(progress.total())
@@ -2538,11 +2565,26 @@ mod tests {
     /// Minimal HTTP/1.1 server for a file whose byte `i` is `i % 251`,
     /// honouring `Range`. The range starting at byte 0 is served slowly so the
     /// other connections finish first and have to take over its tail.
-    async fn serve_pattern(listener: tokio::net::TcpListener, total: u64) {
+    ///
+    /// At most `limit` bodies are served at once; extra requests get `403`,
+    /// the way servers that cap connections per IP answer them.
+    async fn serve_pattern(listener: tokio::net::TcpListener, total: u64, limit: usize) {
+        use std::sync::atomic::AtomicUsize;
         use tokio::io::{AsyncBufReadExt, BufReader};
         const HEAD: &str = "Accept-Ranges: bytes\r\nETag: \"v1\"\r\nConnection: close\r\n";
+
+        /// Frees its place in the cap when dropped.
+        struct Slot(Arc<AtomicUsize>);
+        impl Drop for Slot {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let busy = Arc::new(AtomicUsize::new(0));
         loop {
             let Ok((sock, _)) = listener.accept().await else { return };
+            let busy = Arc::clone(&busy);
             tokio::spawn(async move {
                 let (read, mut write) = sock.into_split();
                 let mut lines = BufReader::new(read).lines();
@@ -2562,6 +2604,13 @@ mod tests {
                     let _ = write.write_all(reply.as_bytes()).await;
                     return;
                 }
+                let mut slot = Some(Slot(Arc::clone(&busy)));
+                if busy.fetch_add(1, Ordering::SeqCst) >= limit {
+                    let _ = write
+                        .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    return;
+                }
                 let (start, end) = range.unwrap_or((0, total - 1));
                 let reply = format!(
                     "HTTP/1.1 206 Partial Content\r\n{HEAD}Content-Range: bytes {start}-{end}/{total}\r\nContent-Length: {}\r\n\r\n",
@@ -2573,6 +2622,12 @@ mod tests {
                 let mut at = start;
                 while at <= end {
                     let n = (end + 1 - at).min(64 * 1024);
+                    if at + n > end {
+                        // Free the place before the last bytes go out: the
+                        // client opens its next connection as soon as it has
+                        // read them, and must not find this one still counted.
+                        slot.take();
+                    }
                     let body: Vec<u8> = (at..at + n).map(|i| (i % 251) as u8).collect();
                     if write.write_all(&body).await.is_err() {
                         return; // client dropped a shrunk segment's connection
@@ -2594,7 +2649,7 @@ mod tests {
         let total: u64 = 16 * 1024 * 1024;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/pattern.bin", listener.local_addr().unwrap());
-        tokio::spawn(serve_pattern(listener, total));
+        tokio::spawn(serve_pattern(listener, total, usize::MAX));
 
         let dir = scratch("split");
         let (client, seg) = clients();
@@ -2620,6 +2675,35 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
+    /// A server that allows fewer connections than spool opens refuses the
+    /// extras with 403. That used to fail the whole download; the refused
+    /// ranges must instead be fetched by the connections that got in.
+    #[tokio::test]
+    async fn refused_connections_hand_their_range_to_the_others() {
+        let total: u64 = 16 * 1024 * 1024;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/capped.bin", listener.local_addr().unwrap());
+        tokio::spawn(serve_pattern(listener, total, 2));
+
+        let dir = scratch("capped");
+        let (client, seg) = clients();
+        let plan = prepare(&client, &url, &dir, 4, false, None).await.unwrap();
+        assert_eq!(plan.ranges.len(), 4, "expected more connections than the cap");
+
+        let progress = Progress::new(plan.segment_count());
+        let path = run(&client, &seg, &plan, &progress, &Throttle::unlimited(), CancellationToken::new(), |_, _| {})
+            .await
+            .expect("refused connections must not fail the download");
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len() as u64, total);
+        assert!(
+            bytes.iter().enumerate().all(|(i, &b)| b == (i % 251) as u8),
+            "every byte where it belongs"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     /// A one-range plan (file below the segmentation threshold, or segments
     /// set to 1) must resume at its saved offset. It used to go down the
     /// whole-file path, which truncated the `.part` and fetched from byte 0.
@@ -2629,7 +2713,7 @@ mod tests {
         let half = total / 2;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/small.bin", listener.local_addr().unwrap());
-        tokio::spawn(serve_pattern(listener, total));
+        tokio::spawn(serve_pattern(listener, total, usize::MAX));
 
         let dir = scratch("single-resume");
         let (client, seg) = clients();
@@ -2663,7 +2747,7 @@ mod tests {
         let total: u64 = 2 * 1024 * 1024;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/slow.bin", listener.local_addr().unwrap());
-        tokio::spawn(serve_pattern(listener, total));
+        tokio::spawn(serve_pattern(listener, total, usize::MAX));
 
         let dir = scratch("pause-durable");
         let (client, seg) = clients();
